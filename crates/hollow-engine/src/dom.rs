@@ -8,6 +8,7 @@
 //! the recursion and work of every later stage.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use html5ever::tendril::TendrilSink;
 use html5ever::tree_builder::{QuirksMode, TreeBuilderOpts};
@@ -70,6 +71,8 @@ pub(crate) struct Dom {
     /// The page has no (or an ancient) doctype, so it expects the old
     /// rendering quirks.
     pub quirks: bool,
+    /// What relative URLs in the page resolve against (`<base>` included).
+    pub base: Arc<Url>,
 }
 
 impl Dom {
@@ -107,8 +110,8 @@ const MAX_SHEET_SOURCES: usize = 256;
 /// absent: Fortress has no JavaScript, so noscript content is what the page
 /// wants shown.
 const DROPPED: &[&str] = &[
-    "script", "template", "iframe", "object", "embed", "svg", "noembed", "noframes", "frameset", "frame", "param",
-    "source", "track", "link", "meta", "area", "datalist", "base", "slot", "applet",
+    "script", "template", "iframe", "embed", "svg", "noembed", "noframes", "frameset", "frame", "param", "source",
+    "track", "link", "meta", "area", "datalist", "base", "slot", "applet",
 ];
 
 enum Target {
@@ -197,6 +200,7 @@ pub(crate) fn parse(html: &str, base_url: &Url) -> Parsed {
     let mut dom = Dom {
         nodes: vec![Node { parent: None, children: Vec::new(), data: NodeData::Root, url: None }],
         quirks: parsed.quirks_mode == QuirksMode::Quirks,
+        base: Arc::new(base_url.clone()),
     };
     let mut base = base_url.clone();
     let mut base_seen = false;
@@ -263,6 +267,22 @@ pub(crate) fn parse(html: &str, base_url: &Url) -> Parsed {
                         // Alternate sheets are fetched (the fetch set must not depend
                         // on page details either) but not applied, as in browsers.
                         let alternate = rel.any(|r| r == "alternate");
+                        // A `data:` sheet is part of the page: decoded here,
+                        // never fetched.
+                        if is_sheet
+                            && !alternate
+                            && sheets.len() < MAX_SHEET_SOURCES
+                            && let Some(href) = e.attr("href").map(str::trim)
+                            && href.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:"))
+                        {
+                            if let Some((mime, bytes)) = crate::data_url::decode(href)
+                                && (mime.is_empty() || mime == "text/css")
+                            {
+                                let css = String::from_utf8_lossy(&bytes).into_owned();
+                                sheets.push(SheetSource::Inline { css, media: e.attr("media").map(str::to_owned) });
+                            }
+                            continue;
+                        }
                         if is_sheet
                             && let Some(url) = e
                                 .attr("href")
@@ -307,9 +327,16 @@ pub(crate) fn parse(html: &str, base_url: &Url) -> Parsed {
                             // Form targets; an empty `action` means the page itself.
                             "form" => e.attr("action").and_then(|h| resolve(&base, h)),
                             "button" | "input" => e.attr("formaction").and_then(|h| resolve(&base, h)),
+                            // Shown as an image when it is one; otherwise its
+                            // children are the fallback.
+                            "object" => e.attr("data").and_then(|s| resolve(&base, s)),
                             _ => None,
                         };
-                        if name == "img"
+                        let image_type = || {
+                            e.attr("type")
+                                .is_some_and(|t| t.trim().get(..6).is_some_and(|p| p.eq_ignore_ascii_case("image/")))
+                        };
+                        if (name == "img" || (name == "object" && image_type()))
                             && let Some(u) = &url
                             && matches!(u.scheme(), "http" | "https")
                             && images.len() < MAX_IMAGES
@@ -338,6 +365,7 @@ pub(crate) fn parse(html: &str, base_url: &Url) -> Parsed {
             _ => {}
         }
     }
+    dom.base = Arc::new(base);
     Parsed { dom, title, sheets, images, stylesheet_urls }
 }
 
@@ -383,7 +411,9 @@ fn image_source(e: &scraper::node::Element) -> Option<&str> {
 /// there is nothing that could ever run them.
 fn resolve(base: &Url, href: &str) -> Option<Url> {
     let href = href.trim();
-    if href.is_empty() || href.len() > MAX_URL_LEN {
+    let data = href.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:"));
+    let max = if data { crate::data_url::MAX_DATA_URL_BYTES } else { MAX_URL_LEN };
+    if href.is_empty() || href.len() > max {
         return None;
     }
     let url = base.join(href).ok()?;

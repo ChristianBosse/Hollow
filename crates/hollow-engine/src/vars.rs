@@ -112,7 +112,7 @@ impl Custom {
                 Decl::Var(raw) => {
                     let mut text = String::new();
                     let ok = r.substitute(&raw.value, &mut text, 0);
-                    let parsed = css::parse_substituted(&raw.name, ok.then_some(text.as_str()));
+                    let parsed = css::parse_substituted(&raw.name, ok.then_some(text.as_str()), raw.base.as_ref());
                     out.extend(parsed.into_iter().map(Cow::Owned));
                 }
                 _ => out.push(Cow::Borrowed(d)),

@@ -8,17 +8,20 @@
 use std::collections::BTreeMap;
 
 use tiny_skia::{
-    FillRule, FilterQuality, IntSize, Mask, Paint, PathBuilder, PathSegment, Pixmap, PixmapPaint, Rect as SkRect,
-    Stroke, Transform,
+    FillRule, FilterQuality, GradientStop, IntSize, LinearGradient, Mask, Paint, PathBuilder, PathSegment, Pattern,
+    Pixmap, PixmapPaint, Point, RadialGradient, Rect as SkRect, Shader, SpreadMode, Stroke, Transform,
 };
 
 use crate::css::Color;
-use crate::layout::{DisplayItem, Laid, Rect};
+use crate::layout::{BgSource, DisplayItem, GradientGeom, Laid, Rect, ResolvedGradient};
 use crate::text::{self, FaceId};
 
 /// Largest frame we will allocate: 64 Mpx (256 MiB of RGBA).
 const MAX_FRAME_PIXELS: u64 = 64 * 1024 * 1024;
 const MAX_FRAME_SIDE: u32 = 16_384;
+/// Largest side of an offscreen gradient tile, in device pixels; larger
+/// tiles are drawn at this resolution and scaled.
+const MAX_TILE_SIDE: u32 = 1024;
 
 /// Glyph outlines in font units, keyed by (face, glyph).
 pub(crate) type GlyphPaths = BTreeMap<(FaceId, u32), tiny_skia::Path>;
@@ -238,9 +241,139 @@ pub(crate) fn paint(laid: &Laid, paths: &GlyphPaths, scroll_y: f32, height: f32,
                 let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..PixmapPaint::default() };
                 pixmap.draw_pixmap(0, 0, (**img).as_ref(), &paint, ts, mask);
             }
+            DisplayItem::Quad { points, color } => {
+                if color.a == 0 {
+                    continue;
+                }
+                // Corners snap to device pixels, like rectangles do.
+                let snap = |p: &(f32, f32)| ((p.0 * scale).round(), ((p.1 - scroll_y) * scale).round());
+                let pts: Vec<(f32, f32)> = points.iter().map(snap).collect();
+                let b =
+                    pts.iter().fold([f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY], |b, p| {
+                        [b[0].min(p.0), b[1].min(p.1), b[2].max(p.0), b[3].max(p.1)]
+                    });
+                if b[2] <= b[0] || b[3] <= b[1] {
+                    continue;
+                }
+                let Some(masked) = coverage(b) else { continue };
+                if masked && !make_mask(&mut masks) {
+                    continue;
+                }
+                let mask = if masked { masks.get(&clip_id) } else { None };
+                let mut pb = PathBuilder::new();
+                pb.move_to(pts[0].0, pts[0].1);
+                for p in &pts[1..] {
+                    pb.line_to(p.0, p.1);
+                }
+                pb.close();
+                if let Some(path) = pb.finish() {
+                    pixmap.fill_path(&path, &paint_for(*color), FillRule::Winding, Transform::identity(), mask);
+                }
+            }
+            DisplayItem::Background { area, radius, tile, repeat, image, .. } => {
+                if area.w <= 0.0 || area.h <= 0.0 || tile.w <= 0.0 || tile.h <= 0.0 {
+                    continue;
+                }
+                // Tiles fill the area in the repeating axes; otherwise there
+                // is just the one.
+                let mut fill = *area;
+                if !repeat[0] {
+                    let x0 = fill.x.max(tile.x);
+                    fill.w = ((fill.x + fill.w).min(tile.x + tile.w) - x0).max(0.0);
+                    fill.x = x0;
+                }
+                if !repeat[1] {
+                    let y0 = fill.y.max(tile.y);
+                    fill.h = ((fill.y + fill.h).min(tile.y + tile.h) - y0).max(0.0);
+                    fill.y = y0;
+                }
+                if fill.w <= 0.0 || fill.h <= 0.0 {
+                    continue;
+                }
+                let b = device(&fill);
+                let Some(masked) = coverage(b) else { continue };
+                if masked && !make_mask(&mut masks) {
+                    continue;
+                }
+                let mask = if masked { masks.get(&clip_id) } else { None };
+                let rounded = *radius > 0.0 && fill == *area;
+                let path = if rounded {
+                    rounded_rect(b[0], b[1], b[2], b[3], radius * scale)
+                } else {
+                    SkRect::from_ltrb(b[0], b[1], b[2].max(b[0] + 1.0), b[3].max(b[1] + 1.0))
+                        .map(PathBuilder::from_rect)
+                };
+                let Some(path) = path else { continue };
+                // The tile in device space.
+                let (ox, oy) = (tile.x * scale, (tile.y - scroll_y) * scale);
+                let (tw, th) = (tile.w * scale, tile.h * scale);
+                let repeats = repeat[0] || repeat[1];
+                // Kept alive for the pattern that borrows it.
+                let tile_pixmap;
+                let mut paint = Paint { anti_alias: rounded, ..Paint::default() };
+                match image {
+                    BgSource::Image(id) => {
+                        let Some(img) = laid.images.get(*id as usize) else { continue };
+                        let ts =
+                            Transform::from_row(tw / img.width() as f32, 0.0, 0.0, th / img.height() as f32, ox, oy);
+                        let spread = if repeats { SpreadMode::Repeat } else { SpreadMode::Pad };
+                        paint.shader = Pattern::new((**img).as_ref(), spread, FilterQuality::Bilinear, 1.0, ts);
+                    }
+                    BgSource::Gradient(g) => {
+                        let covers = |a0: f32, a1: f32, t0: f32, t1: f32| t0 <= a0 && t1 >= a1;
+                        let whole = (!repeat[0] || covers(fill.x, fill.x + fill.w, tile.x, tile.x + tile.w))
+                            && (!repeat[1] || covers(fill.y, fill.y + fill.h, tile.y, tile.y + tile.h));
+                        if whole {
+                            let ts = Transform::from_row(scale, 0.0, 0.0, scale, ox, oy);
+                            let Some(shader) = gradient_shader(g, ts) else { continue };
+                            paint.shader = shader;
+                        } else {
+                            // Smaller tiles that repeat: draw one, then tile it.
+                            let (pw, ph) = (tile_px(tw), tile_px(th));
+                            let Some(mut p) = Pixmap::new(pw, ph) else { continue };
+                            let k = Transform::from_scale(pw as f32 / tile.w, ph as f32 / tile.h);
+                            let Some(shader) = gradient_shader(g, k) else { continue };
+                            let full = SkRect::from_xywh(0.0, 0.0, pw as f32, ph as f32);
+                            if let Some(r) = full {
+                                p.fill_rect(r, &Paint { shader, ..Paint::default() }, Transform::identity(), None);
+                            }
+                            tile_pixmap = p;
+                            let ts = Transform::from_row(tw / pw as f32, 0.0, 0.0, th / ph as f32, ox, oy);
+                            let q = FilterQuality::Bilinear;
+                            paint.shader = Pattern::new(tile_pixmap.as_ref(), SpreadMode::Repeat, q, 1.0, ts);
+                        }
+                    }
+                }
+                pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), mask);
+            }
         }
     }
     (w, h, pixmap.take())
+}
+
+/// Device size of an offscreen gradient tile: at least one pixel, and not
+/// so large that a hostile page can make us allocate much.
+fn tile_px(v: f32) -> u32 {
+    if v.is_finite() { v.ceil().clamp(1.0, MAX_TILE_SIDE as f32) as u32 } else { 1 }
+}
+
+/// A tiny-skia shader for a laid-out gradient; `ts` maps the tile's CSS px
+/// to device pixels.
+fn gradient_shader(g: &ResolvedGradient, ts: Transform) -> Option<Shader<'static>> {
+    let stops: Vec<GradientStop> =
+        g.stops.iter().map(|(p, c)| GradientStop::new(*p, tiny_skia::Color::from_rgba8(c.r, c.g, c.b, c.a))).collect();
+    let mode = if g.repeating { SpreadMode::Repeat } else { SpreadMode::Pad };
+    match g.geom {
+        GradientGeom::Linear { start, end } => {
+            let (a, b) = (Point::from_xy(start.0, start.1), Point::from_xy(end.0, end.1));
+            LinearGradient::new(a, b, stops, mode, ts)
+        }
+        GradientGeom::Radial { center, r0, r1, ratio } => {
+            let ts = ts.pre_translate(center.0, center.1).pre_scale(1.0, ratio);
+            let o = Point::from_xy(0.0, 0.0);
+            RadialGradient::new(o, r0, o, r1, stops, mode, ts)
+        }
+    }
 }
 
 /// A frame-sized mask that is opaque inside the device rectangle `c`.

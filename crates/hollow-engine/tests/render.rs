@@ -707,3 +707,298 @@ fn hostile_layout_inputs() {
         .unwrap();
     handle.join().expect("hostile layout input panicked or overflowed the stack");
 }
+
+// ---------------------------------------------------------------------------
+// Generated content
+
+const YELLOW: [u8; 4] = [255, 255, 0, 255];
+
+#[test]
+fn before_and_after_generate_boxes() {
+    // Empty `content` boxes as decorations: block, absolute, floated.
+    let html = "<style>
+        .a::before { content: ''; display: block; height: 10px; background: red }
+        .a::after { content: ''; display: block; height: 10px; background: blue }
+        .p { position: relative; height: 30px }
+        .p:before { content: ''; position: absolute; left: 50px; top: 5px; width: 10px; height: 10px; background: green }
+        .f::before { content: ''; float: right; width: 20px; height: 20px; background: red }
+        .n::before { content: none; display: block; height: 50px; background: red }
+        </style>
+        <div class=a></div><div class=p></div><div class=f></div><div class=n></div>";
+    let f = frame(html, 200.0, 80.0);
+    assert_eq!(pixel(&f, 5, 5), RED);
+    assert_eq!(pixel(&f, 5, 15), BLUE);
+    assert_eq!(pixel(&f, 55, 30), GREEN, "absolutely positioned against .p");
+    assert_eq!(pixel(&f, 5, 30), WHITE);
+    assert_eq!(pixel(&f, 190, 55), RED, "floated right");
+    assert_eq!(ink(&f, 0, 70, 200, 80), 0, "content: none generates nothing");
+}
+
+#[test]
+fn generated_text_counters_and_quotes() {
+    let text = |css: &str, body: &str| {
+        let l = layout(&format!("<style>{css}</style>{PLAIN}{body}"), 600.0);
+        text_color_ink(&l.paint(0.0, 100.0, 1.0), [255, 0, 0])
+    };
+    let red = "p::before { color: #ff0000; font: bold 40px sans-serif }";
+    assert!(text(&format!("{red} p::before {{ content: 'x' }}"), "<p></p>") > 10);
+    assert!(text(&format!("{red} p::before {{ content: attr(data-x) }}"), "<p data-x=hello></p>") > 30);
+    assert_eq!(text(&format!("{red} p::before {{ content: attr(data-y) }}"), "<p data-x=hello></p>"), 0);
+    // Counters in generated text, with their own styles.
+    let counted = text(
+        &format!(
+            "{red} body {{ counter-reset: n 1000 }} p {{ counter-increment: n }} p::before {{ content: counter(n, upper-roman) }}"
+        ),
+        "<p></p>",
+    );
+    let one = text(&format!("{red} p::before {{ content: 'M' }}"), "<p></p>");
+    assert!(counted > 0 && counted >= one, "M (1001 is MI): {counted} {one}");
+    // <q> gets its quotes from the UA sheet, in the element's color.
+    let l =
+        layout(&format!("{PLAIN}<p style='margin:0; color:#ff0000; font: bold 40px sans-serif'><q>q</q></p>"), 300.0);
+    let with_quotes = text_color_ink(&l.paint(0.0, 40.0, 1.0), [255, 0, 0]);
+    let l = layout(
+        &format!(
+            "<style>q {{ quotes: none }}</style>{PLAIN}<p style='margin:0; color:#ff0000; font: bold 40px sans-serif'><q>q</q></p>"
+        ),
+        300.0,
+    );
+    assert!(with_quotes > text_color_ink(&l.paint(0.0, 40.0, 1.0), [255, 0, 0]));
+}
+
+#[test]
+fn css_triangles_have_diagonal_edges() {
+    // The usual caret: one colored border between two transparent ones.
+    let f = frame(
+        "<div style='width:0; height:0; border-top:20px solid #0000ff; border-left:20px solid transparent; \
+         border-right:20px solid transparent'></div>",
+        100.0,
+        30.0,
+    );
+    assert_eq!(pixel(&f, 20, 2), BLUE, "the wide end");
+    assert_eq!(pixel(&f, 20, 17), BLUE, "the tip");
+    assert_eq!(pixel(&f, 3, 17), WHITE, "cut off on the diagonal");
+    assert_eq!(pixel(&f, 37, 17), WHITE);
+}
+
+// ---------------------------------------------------------------------------
+// CSS tables
+
+#[test]
+fn display_table_cells_sit_side_by_side() {
+    // Lone cells get an anonymous row and table around them.
+    let html = "<div style='display:table-cell; width:40px; height:30px; background:red'></div>\
+                <div style='display:table-cell; width:40px; background:blue'></div>";
+    let f = frame(html, 200.0, 40.0);
+    assert_eq!(pixel(&f, 20, 15), RED);
+    assert_eq!(pixel(&f, 60, 25), BLUE, "the row's cells are as tall as its tallest");
+    assert_eq!(pixel(&f, 100, 15), WHITE);
+    // Vertical alignment in cells.
+    let html = "<div style='display:table'><div style='display:table-row'>\
+                <div style='display:table-cell; height:60px; width:10px'></div>\
+                <div style='display:table-cell; vertical-align:middle'><div style='width:10px; height:10px; background:red'></div></div>\
+                <div style='display:table-cell; vertical-align:bottom'><div style='width:10px; height:10px; background:blue'></div></div>\
+                </div></div>";
+    let f = frame(html, 100.0, 70.0);
+    assert_eq!(pixel(&f, 15, 30), RED);
+    assert_eq!(pixel(&f, 15, 5), WHITE);
+    assert_eq!(pixel(&f, 25, 55), BLUE);
+    // The clearfix: a table-like ::after clears the floats inside.
+    let l = layout(
+        &format!(
+            "<style>.cf::after {{ content: ''; display: table; clear: both }}</style>{PLAIN}\
+             <div class=cf><div style='float:left; height:50px; width:10px'></div></div>"
+        ),
+        100.0,
+    );
+    assert_eq!(l.height(), 50.0);
+}
+
+#[test]
+fn table_features() {
+    // border-spacing with two values, a caption below, and a table height
+    // shared out among the rows.
+    let html = "<div style='display:table; border-spacing:10px 4px; height:60px; background:#00ff00'>\
+                <div style='display:table-caption; caption-side:bottom; height:10px; background:blue'></div>\
+                <div style='display:table-row'><div style='display:table-cell; width:20px; background:red'></div></div>\
+                </div>";
+    let f = frame(html, 200.0, 100.0);
+    assert_eq!(pixel(&f, 5, 30), [0, 255, 0, 255], "spacing shows the table background");
+    assert_eq!(pixel(&f, 15, 30), RED, "the row fills the table's height");
+    assert_eq!(pixel(&f, 15, 2), [0, 255, 0, 255]);
+    assert_eq!(pixel(&f, 15, 65), BLUE, "the caption is below the 60px table");
+    // Fixed layout: the first row's widths, whatever the content.
+    let html = "<table style='table-layout:fixed; width:200px; border-spacing:0'><tr>\
+                <td style='width:50px; padding:0; background:red'>xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx</td>\
+                <td style='padding:0; background:blue'>y</td></tr></table>";
+    let f = frame(html, 300.0, 30.0);
+    assert_eq!(pixel(&f, 45, 3), RED);
+    assert_eq!(pixel(&f, 55, 3), BLUE);
+    // Collapsed borders: one line between cells instead of two.
+    let cells = |collapse: &str| {
+        let html = format!(
+            "<table style='border-collapse:{collapse}; border-spacing:0'><tr>\
+             <td style='border:2px solid #0000ff; padding:0; width:10px; height:10px'></td>\
+             <td style='border:2px solid #0000ff; padding:0; width:10px; height:10px'></td></tr></table>"
+        );
+        let f = frame(&html, 100.0, 30.0);
+        (0..100).filter(|&x| pixel(&f, x, 7) == BLUE).count()
+    };
+    assert_eq!(cells("separate"), 8);
+    assert_eq!(cells("collapse"), 6);
+}
+
+// ---------------------------------------------------------------------------
+// Backgrounds
+
+/// A 1x1 yellow PNG (Acid2's), percent-encoded as Acid2 has it.
+const YELLOW_PIXEL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mP4%2F58BAAT%2FAf9jgNErAAAAAElFTkSuQmCC";
+
+#[test]
+fn data_url_backgrounds_tile_and_position() {
+    let html = format!(
+        "<div style='width:40px; height:40px; background:red url({YELLOW_PIXEL})'></div>\
+         <div style='width:40px; height:40px; background:url({YELLOW_PIXEL}) no-repeat right 10px bottom 5px / 10px 10px'></div>\
+         <div style='width:40px; height:20px; background:url({YELLOW_PIXEL}) repeat-x 0 50% / 5px 5px'></div>"
+    );
+    let f = frame(&html, 100.0, 100.0);
+    assert_eq!(pixel(&f, 20, 20), YELLOW, "repeats over the color");
+    // 10x10 at right 10px, bottom 5px of the second box (y 40..80).
+    assert_eq!(pixel(&f, 25, 70), YELLOW);
+    assert_eq!(pixel(&f, 15, 70), WHITE);
+    assert_eq!(pixel(&f, 25, 77), WHITE);
+    // A 5px band through the middle of the third box (y 80..100).
+    assert_eq!(pixel(&f, 35, 89), YELLOW);
+    assert_eq!(pixel(&f, 35, 82), WHITE);
+}
+
+#[test]
+fn background_images_come_from_resources() {
+    let html = format!(
+        "<style>.x {{ background-image: url(img/bg.png); background-size: cover; width: 50px; height: 20px }}
+         @media (max-width: 10px) {{ .y {{ background: url(narrow.png) }} }}
+         .unused {{ background: url(unused.png) }}</style>
+         {PLAIN}<div class=x></div><div class=y></div><p style='background: url(\"/inline.png\")'>p</p>
+         <link rel=stylesheet href=/s/site.css><div class=z style='width:20px; height:20px'></div>"
+    );
+    let doc = Document::parse(&html, &base());
+    let urls: Vec<String> = doc.image_urls().iter().map(|u| u.to_string()).collect();
+    // Media queries don't matter (the fetch set must not depend on the
+    // viewport); rules for elements the page doesn't have do.
+    assert_eq!(
+        urls,
+        ["https://example.org/dir/img/bg.png", "https://example.org/dir/narrow.png", "https://example.org/inline.png"]
+    );
+    let mut res = Resources::new();
+    let sheet = Url::parse("https://example.org/s/site.css").unwrap();
+    assert!(doc.stylesheet_image_urls(&res).is_empty(), "nothing before the sheet is in");
+    res.insert_stylesheet(&sheet, ".z { background: url(z.png) } .gone { background: url(no.png) }").unwrap();
+    let more = doc.stylesheet_image_urls(&res);
+    assert_eq!(more, [Url::parse("https://example.org/s/z.png").unwrap()], "relative to the sheet");
+    res.insert_image(&Url::parse(&urls[0]).unwrap(), &png(10, 10, [0, 0, 255, 255])).unwrap();
+    res.insert_image(&more[0], &png(10, 10, [255, 0, 0, 255])).unwrap();
+    let f = Layout::new(&doc, &res, 100.0).paint(0.0, 100.0, 1.0);
+    assert_eq!(pixel(&f, 45, 15), BLUE, "covers the 50x20 box");
+    let z = (0..100).find(|&y| pixel(&f, 5, y) == RED);
+    assert!(z.is_some(), "the linked sheet's image is drawn");
+}
+
+#[test]
+fn gradients_paint() {
+    let html = "<div style='width:100px; height:10px; background:linear-gradient(to right, #ff0000, #0000ff)'></div>\
+                <div style='width:100px; height:10px; background:linear-gradient(90deg, #ff0000 50%, #0000ff 50%)'></div>\
+                <div style='width:40px; height:40px; background:radial-gradient(circle closest-side, #ff0000 50%, #0000ff 50%)'></div>\
+                <div style='width:40px; height:10px; background:repeating-linear-gradient(to right, #ff0000 0 5px, #0000ff 5px 10px)'></div>";
+    let f = frame(html, 120.0, 80.0);
+    let [r0, _, b0, _] = pixel(&f, 1, 5);
+    let [r1, _, b1, _] = pixel(&f, 98, 5);
+    assert!(r0 > 240 && b0 < 15 && b1 > 240 && r1 < 15, "red to blue: {r0},{b0} {r1},{b1}");
+    assert_eq!(pixel(&f, 45, 15), RED, "hard stop");
+    assert_eq!(pixel(&f, 55, 15), BLUE);
+    assert_eq!(pixel(&f, 20, 40), RED, "center of the circle");
+    assert_eq!(pixel(&f, 2, 22), BLUE, "corner");
+    assert_eq!(pixel(&f, 2, 65), RED, "stripes");
+    assert_eq!(pixel(&f, 7, 65), BLUE);
+    assert_eq!(pixel(&f, 12, 65), RED);
+}
+
+#[test]
+fn background_clip_origin_and_layers() {
+    let html = format!(
+        "<div style='width:20px; height:20px; padding:10px; border:5px solid transparent; \
+         background: url({YELLOW_PIXEL}) no-repeat content-box 0 0 / 5px 5px, #0000ff content-box'></div>"
+    );
+    let f = frame(&html, 100.0, 60.0);
+    assert_eq!(pixel(&f, 2, 2), WHITE, "the color is clipped to the content box");
+    assert_eq!(pixel(&f, 12, 12), WHITE);
+    assert_eq!(pixel(&f, 17, 17), YELLOW, "the image layer is on top, at the content box");
+    assert_eq!(pixel(&f, 30, 30), BLUE);
+}
+
+#[test]
+fn data_stylesheets_and_object_images() {
+    // A `data:` stylesheet is decoded in the engine, never fetched.
+    let doc = Document::parse(
+        "<link rel=stylesheet href='data:text/css,div%20%7Bbackground%3A%23ff0000%7D'>\
+         <body style='margin:0'><div style='height:10px'></div>",
+        &base(),
+    );
+    assert!(doc.stylesheet_urls().is_empty());
+    let f = Layout::new(&doc, &Resources::new(), 50.0).paint(0.0, 20.0, 1.0);
+    assert_eq!(pixel(&f, 5, 5), RED);
+    // <object>: its image if it is one, otherwise its fallback content.
+    let html = format!(
+        "<object data='data:text/plain,nope'><object data='{YELLOW_PIXEL}' width=10 height=10>X</object></object>"
+    );
+    let f = frame(&html, 50.0, 20.0);
+    assert!((0..20).any(|y| pixel(&f, 5, y) == YELLOW));
+    assert_eq!(text_color_ink(&f, [0, 0, 0]), 0, "the fallback text isn't shown");
+}
+
+#[test]
+fn floats_paint_over_block_backgrounds() {
+    // CSS 2.1 Appendix E: floats paint after in-flow block backgrounds.
+    let html = "<div style='float:left; width:20px; height:20px; background:#0000ff'></div>\
+                <div style='height:20px; background:red'></div>";
+    assert_eq!(pixel(&frame(html, 100.0, 30.0), 10, 10), BLUE);
+}
+
+#[test]
+fn hostile_generated_content_tables_and_backgrounds() {
+    let deep_counters = "<div style='counter-reset:c'>".repeat(400) + "x";
+    let inputs: Vec<String> = vec![
+        // Many pseudo-elements, each with a lot of content.
+        format!(
+            "<style>p::before {{ content: '{}' counters(c, '.') attr(id); counter-increment: c }} p::after {{ content: open-quote }}</style>{}",
+            "x".repeat(10_000),
+            "<p id=a>".repeat(5_000)
+        ),
+        format!("<style>div::before {{ content: counters(c, '----------'); counter-increment: c }}</style>{deep_counters}"),
+        "<style>*::before, *::after { content: ''; display: table-cell }</style>".to_string() + &"<div>".repeat(3_000),
+        "<div style='display:table-cell'>".repeat(3_000) + "x",
+        "<div style='display:table-row'><span style='display:table-caption'>".repeat(1_000) + "x",
+        format!("<body style='background:url({YELLOW_PIXEL}) 0 0 / 0.001px 0.001px; height: 100000px'>"),
+        format!(
+            "<div style='height:50000px; background:repeating-linear-gradient({}#f00 0 1px, #00f 1px 2px)'></div>",
+            "#0f0 0px, ".repeat(60)
+        ),
+        "<div style='width:10px; height:10px; background-size: 1e30px 1e30px; background: radial-gradient(1e30px 1e-30px, red, blue)'></div>"
+            .to_string(),
+        format!("<div style='background:{}red'>x</div>", "url(data:,a) no-repeat, ".repeat(40)),
+        "<table style='border-collapse:collapse; table-layout:fixed; width:1e9px; height:1e9px'><tr><td>x".to_string(),
+    ];
+    let handle = std::thread::Builder::new()
+        .stack_size(1 << 20)
+        .spawn(move || {
+            for html in &inputs {
+                let doc = Document::parse(html, &base());
+                let _ = doc.image_urls();
+                let l = Layout::new(&doc, &Resources::new(), 800.0);
+                assert!(l.height().is_finite() && l.height() >= 0.0);
+                let f = l.paint(0.0, 600.0, 1.0);
+                assert_eq!(f.rgba.len(), (f.width * f.height * 4) as usize);
+            }
+        })
+        .unwrap();
+    handle.join().expect("hostile input panicked or overflowed the stack");
+}

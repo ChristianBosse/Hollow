@@ -20,7 +20,9 @@
 //! assert_eq!((frame.width, frame.height), (800, 600));
 //! ```
 
+mod content;
 mod css;
+mod data_url;
 mod dom;
 mod form;
 mod image;
@@ -30,7 +32,7 @@ mod style;
 mod text;
 mod vars;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
 use tiny_skia::Pixmap;
@@ -46,6 +48,11 @@ pub const MAX_STYLESHEET_BYTES: usize = css::MAX_CSS_BYTES;
 const MAX_TOTAL_STYLESHEET_BYTES: usize = 8 << 20;
 /// Total decoded image pixels one document may hold (256 MiB of RGBA).
 const MAX_TOTAL_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
+/// CSS images (backgrounds, generated content) listed for the page's own
+/// CSS, and again for its linked stylesheets.
+pub const MAX_CSS_IMAGES: usize = 64;
+/// Images one document may hold: `<img>`s plus both CSS lists.
+const MAX_RESOURCE_IMAGES: usize = dom::MAX_IMAGES + 2 * MAX_CSS_IMAGES;
 
 /// A parsed HTML document. Independent of viewport size and of fetched
 /// resources, so one `Document` serves any number of relayouts.
@@ -54,6 +61,7 @@ pub struct Document {
     url: Url,
     dom: dom::Dom,
     title: Option<String>,
+    /// `<img>` sources, then images the page's own CSS uses.
     images: Vec<Url>,
     stylesheet_urls: Vec<Url>,
     /// `<style>` and `<link rel=stylesheet>` in document order: the cascade
@@ -80,19 +88,53 @@ impl Document {
                 dom::SheetSource::Inline { css, media: m } => {
                     let text = dom::truncate(&css, budget);
                     budget -= text.len();
-                    DocSheet::Inline(css::Stylesheet::parse(text), media(m))
+                    DocSheet::Inline(css::Stylesheet::parse_with_base(text, Some(&parsed.dom.base)), media(m))
                 }
                 dom::SheetSource::Linked { url, media: m } => DocSheet::Linked(url, media(m)),
             })
             .collect();
-        Document {
+        let mut doc = Document {
             url: base_url.clone(),
             dom: parsed.dom,
             title: parsed.title,
             images: parsed.images,
             stylesheet_urls: parsed.stylesheet_urls,
             sheets,
+        };
+        let css_images = doc.css_image_urls();
+        doc.images.extend(css_images);
+        doc
+    }
+
+    /// Images the page's own CSS refers to (`<style>`, `style=""`, `data:`
+    /// sheets and `background` attributes) for elements it has, at most
+    /// [`MAX_CSS_IMAGES`], skipping `<img>` sources already listed.
+    fn css_image_urls(&self) -> Vec<Url> {
+        let mut seen: BTreeSet<String> = self.images.iter().map(|u| u.as_str().to_owned()).collect();
+        let mut out = Vec::new();
+        let tree = css::Tree::new(&self.dom);
+        for s in &self.sheets {
+            if let DocSheet::Inline(sheet, _) = s {
+                sheet.image_urls(&tree, &mut seen, &mut out, MAX_CSS_IMAGES);
+            }
         }
+        let base = Some(&self.dom.base);
+        for id in 0..self.dom.nodes.len() {
+            let Some(el) = self.dom.element(id) else { continue };
+            let mut found = Vec::new();
+            if let Some(style) = el.attr("style").filter(|s| s.to_ascii_lowercase().contains("url(")) {
+                for d in css::parse_declarations(style, base) {
+                    css::decl_urls(&d.decl, &mut found);
+                }
+            }
+            found.extend(el.attr("background").and_then(|v| css::resolve_url(v, base)));
+            for u in found {
+                if out.len() < MAX_CSS_IMAGES && matches!(u.scheme(), "http" | "https") && seen.insert(u.to_string()) {
+                    out.push((*u).clone());
+                }
+            }
+        }
+        out
     }
 
     /// The `<title>`, whitespace-collapsed, if there is a non-empty one.
@@ -100,11 +142,41 @@ impl Document {
         self.title.clone()
     }
 
-    /// Absolute http(s) URLs of images the page wants (from `<img src>`, or
-    /// the first `srcset` candidate), deduplicated, in document order, at
-    /// most 64.
+    /// Absolute http(s) URLs of images the page wants: `<img src>` (or the
+    /// first `srcset` candidate), at most 64, in document order; then those
+    /// the page's own CSS uses (`<style>`, `style=""` and `background`
+    /// attributes), at most [`MAX_CSS_IMAGES`]. Deduplicated. CSS images
+    /// are listed only for rules that match some element, but whatever
+    /// their `@media`, so the list never depends on the viewport (FP-05).
+    /// `data:` URLs are never listed: the engine decodes them itself.
     pub fn image_urls(&self) -> Vec<Url> {
         self.images.clone()
+    }
+
+    /// Absolute http(s) URLs of images used by the linked stylesheets that
+    /// are in `resources` (relative URLs resolve against each sheet's own
+    /// URL), on the same terms as the CSS part of [`Document::image_urls`]
+    /// and leaving out everything that one lists; at most
+    /// [`MAX_CSS_IMAGES`], in document order of the elements using them.
+    ///
+    /// Stylesheets are only known once fetched, so the broker calls this
+    /// after inserting them with [`Resources::insert_stylesheet`], fetches
+    /// the result, inserts each with [`Resources::insert_image`] and lays
+    /// out again.
+    pub fn stylesheet_image_urls(&self, resources: &Resources) -> Vec<Url> {
+        let mut seen: BTreeSet<String> = self.images.iter().map(|u| u.as_str().to_owned()).collect();
+        let mut out = Vec::new();
+        let tree = css::Tree::new(&self.dom);
+        let mut done = BTreeSet::new();
+        for s in &self.sheets {
+            if let DocSheet::Linked(url, _) = s
+                && done.insert(url.as_str())
+                && let Some(sheet) = resources.stylesheet(url)
+            {
+                sheet.image_urls(&tree, &mut seen, &mut out, MAX_CSS_IMAGES);
+            }
+        }
+        out
     }
 
     /// Absolute http(s) URLs of `<link rel~=stylesheet href>`, deduplicated,
@@ -178,7 +250,8 @@ pub fn register_test_fonts(fonts: Vec<(String, Vec<u8>)>) -> bool {
 }
 
 /// Subresources the broker fetched for a document, keyed by the absolute
-/// URLs from [`Document::image_urls`] and [`Document::stylesheet_urls`].
+/// URLs from [`Document::image_urls`], [`Document::stylesheet_urls`] and
+/// [`Document::stylesheet_image_urls`].
 #[derive(Default)]
 pub struct Resources {
     images: BTreeMap<String, Arc<Pixmap>>,
@@ -218,7 +291,7 @@ impl Resources {
     /// drawn; the page lays out as if they had failed to load.
     pub fn insert_image(&mut self, url: &Url, bytes: &[u8]) -> Result<(u32, u32), ImageError> {
         let replaced = self.images.get(url.as_str()).map_or(0, |p| u64::from(p.width()) * u64::from(p.height()));
-        if replaced == 0 && self.images.len() >= dom::MAX_IMAGES {
+        if replaced == 0 && self.images.len() >= MAX_RESOURCE_IMAGES {
             return Err(ImageError::BudgetExhausted);
         }
         let pixmap = image::decode(bytes)?;
@@ -234,7 +307,8 @@ impl Resources {
 
     /// Parses and stores a stylesheet under `url`. Sheets over 2 MiB, or
     /// past 8 MiB / 32 sheets in total, are rejected and simply not applied.
-    /// `@import` inside it is ignored (no further fetches).
+    /// `@import` inside it is ignored (no further fetches). Its relative
+    /// `url()`s resolve against `url`.
     pub fn insert_stylesheet(&mut self, url: &Url, css: &str) -> Result<(), StylesheetError> {
         if css.len() > MAX_STYLESHEET_BYTES {
             return Err(StylesheetError::TooLarge);
@@ -248,7 +322,8 @@ impl Resources {
             return Err(StylesheetError::BudgetExhausted);
         }
         self.css_bytes = total;
-        self.stylesheets.insert(url.as_str().to_owned(), (Arc::new(css::Stylesheet::parse(css)), css.len()));
+        let sheet = css::Stylesheet::parse_with_base(css, Some(&Arc::new(url.clone())));
+        self.stylesheets.insert(url.as_str().to_owned(), (Arc::new(sheet), css.len()));
         Ok(())
     }
 
@@ -332,7 +407,8 @@ impl Layout {
             })
             .collect();
         let styles = style::compute(&doc.dom, ua_sheet(), &author, width);
-        let laid = layout::layout(&doc.dom, &styles, resources, width);
+        let generated = content::generate(&doc.dom, &styles);
+        let laid = layout::layout(&doc.dom, &styles, &generated, resources, width);
         let paths = paint::glyph_paths(&laid);
         Layout { laid, paths }
     }

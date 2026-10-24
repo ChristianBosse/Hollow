@@ -6,13 +6,22 @@
 //! whose selector list contains an unsupported selector are dropped whole,
 //! as CSS requires, rather than being matched approximately.
 
+mod values;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+
+use url::Url;
 
 use crate::dom::{Dom, Element, NodeData, NodeId};
 use crate::style::{Display, ListStyle, TextAlign, TextTransform, VAlign, WhiteSpace};
 use crate::text::Family;
 use crate::vars;
+
+pub(crate) use values::{
+    Base, BgSize, BoxArea, ContentItem, CounterList, CounterOp, Gradient, Image, QuoteList, RadialSize, Repeat, Shape,
+    decl_urls, resolve_url,
+};
 
 /// Hostile-input budgets for one stylesheet.
 pub(crate) const MAX_CSS_BYTES: usize = 2 << 20;
@@ -233,6 +242,19 @@ pub(crate) enum Prop {
     Order,
     Gap(usize),
     Mask,
+    BgImage,
+    BgRepeat,
+    BgPosition,
+    BgSize,
+    BgOrigin,
+    BgClip,
+    BgAttachment,
+    Content,
+    Counters(CounterOp),
+    Quotes,
+    BorderCollapse,
+    TableLayout,
+    CaptionSide,
 }
 
 impl Prop {
@@ -251,6 +273,9 @@ impl Prop {
                 | Prop::Visibility
                 | Prop::TextTransform
                 | Prop::BorderSpacing
+                | Prop::Quotes
+                | Prop::BorderCollapse
+                | Prop::CaptionSide
         )
     }
 }
@@ -295,7 +320,8 @@ pub(crate) enum Decl {
     MaxWidth(Option<Length>),
     VerticalAlign(VAlign),
     BorderBox(bool),
-    BorderSpacing(Length),
+    /// Horizontal, vertical.
+    BorderSpacing(Length, Length),
     Position(Position),
     /// Side order as for margins: top, right, bottom, left.
     Inset(usize, Length),
@@ -329,6 +355,27 @@ pub(crate) enum Decl {
     Gap(usize, Length),
     /// Any `mask`/`mask-image` other than `none`.
     Masked(bool),
+    /// Background layers, top first; `None` is `none`.
+    BgImage(Arc<[Option<Image>]>),
+    /// x and y.
+    BgRepeat(Arc<[[Repeat; 2]]>),
+    BgPosition(Arc<[[Length; 2]]>),
+    BgSize(Arc<[BgSize]>),
+    BgOrigin(Arc<[BoxArea]>),
+    BgClip(Arc<[BoxArea]>),
+    /// `background-attachment: fixed`.
+    BgFixed(Arc<[bool]>),
+    /// `None` is `normal` and `none`, which are the same for `::before` and
+    /// `::after`.
+    Content(Option<Arc<[ContentItem]>>),
+    Counters(CounterOp, CounterList),
+    /// `None` is `auto`.
+    Quotes(Option<QuoteList>),
+    BorderCollapse(bool),
+    /// `table-layout: fixed`.
+    TableFixed(bool),
+    /// `caption-side: bottom`.
+    CaptionBottom(bool),
     Wide(Prop, Wide),
 }
 
@@ -345,6 +392,8 @@ pub(crate) struct RawDecl {
     /// Custom property names keep their case; other names are lowercase.
     pub name: Arc<str>,
     pub value: Arc<str>,
+    /// What `url()`s in the substituted value resolve against.
+    pub base: Option<Arc<Url>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -419,12 +468,22 @@ struct Compound {
     pseudo: Vec<Pseudo>,
 }
 
+/// The generated-content pseudo-elements.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum PseudoElement {
+    Before,
+    After,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Selector {
     /// Left to right; the last compound matches the subject element.
     compounds: Vec<Compound>,
     /// `combinators[i]` sits between `compounds[i]` and `compounds[i + 1]`.
     combinators: Vec<Combinator>,
+    /// `::before` / `::after`: the rule styles that pseudo-element of the
+    /// subject rather than the subject itself.
+    pub pseudo: Option<PseudoElement>,
     pub specificity: u32,
 }
 
@@ -434,6 +493,8 @@ pub(crate) struct Rule {
     pub decls: Vec<Declaration>,
     /// Enclosing `@media` conditions; all must hold.
     pub media: Vec<MediaList>,
+    /// http(s) images the declarations refer to.
+    pub images: Vec<Arc<Url>>,
 }
 
 /// A parsed stylesheet with rules indexed by their subject compound, so
@@ -448,28 +509,31 @@ pub(crate) struct Stylesheet {
 }
 
 /// A rule that matched an element.
+#[derive(Clone, Copy)]
 pub(crate) struct Matched<'a> {
     pub specificity: u32,
     /// Source order across all sheets of the cascade.
     pub order: u32,
     pub decls: &'a [Declaration],
+    /// Set when the rule applies to that pseudo-element of the element.
+    pub pseudo: Option<PseudoElement>,
 }
 
 impl Stylesheet {
     pub fn parse(css: &str) -> Stylesheet {
+        Stylesheet::parse_with_base(css, None)
+    }
+
+    /// Parses a sheet whose relative `url()`s resolve against `base`.
+    pub fn parse_with_base(css: &str, base: Base<'_>) -> Stylesheet {
         let mut sheet = Stylesheet::default();
-        sheet.append(css);
+        let css = strip_comments(truncate(css, MAX_CSS_BYTES).trim_start_matches('\u{FEFF}'));
+        sheet.parse_rules(&css, &mut Vec::new(), base);
         sheet
     }
 
-    /// Adds rules at the end of the sheet.
-    pub fn append(&mut self, css: &str) {
-        let css = strip_comments(truncate(css, MAX_CSS_BYTES).trim_start_matches('\u{FEFF}'));
-        self.parse_rules(&css, &mut Vec::new());
-    }
-
     /// Parses a rule list: the top level of a sheet or the body of `@media`.
-    fn parse_rules(&mut self, css: &str, media: &mut Vec<MediaList>) {
+    fn parse_rules(&mut self, css: &str, media: &mut Vec<MediaList>, base: Base<'_>) {
         let b = css.as_bytes();
         let mut pos = 0;
         while pos < b.len() && self.rules.len() < MAX_RULES {
@@ -488,21 +552,25 @@ impl Stylesheet {
                 break;
             }
             let at_rule = b[pos] == b'@';
-            let (i, stop) = find_top_level(b, pos, b"{;}");
+            // A `;` or `}` ends an at-rule statement; for a style rule it is
+            // part of the selector, which makes the whole rule invalid (so
+            // `p {} ; q {}` drops the `q` rule, as browsers do).
+            let stops: &[u8] = if at_rule { b"{;}" } else { b"{" };
+            let (i, stop) = find_top_level(b, pos, stops);
             match stop {
                 Some(b'{') => {
                     let (end, close) = skip_block(b, i);
                     let prelude = &css[pos..i];
                     let body = &css[i + 1..close];
                     if !at_rule {
-                        self.add_rule(prelude, body, media);
+                        self.add_rule(prelude, body, media, base);
                     } else if let Some(query) = strip_prefix_ci(prelude, "@media")
                         && media.len() < MAX_MEDIA_NESTING
                     {
                         // Evaluated at layout time against the viewport width.
                         // Which sheets are *fetched* never depends on it.
                         media.push(MediaList::parse(query));
-                        self.parse_rules(body, media);
+                        self.parse_rules(body, media, base);
                         media.pop();
                     }
                     // Other block at-rules (@supports, @font-face, @keyframes,
@@ -510,19 +578,23 @@ impl Stylesheet {
                     pos = end;
                 }
                 // Statement at-rules such as `@import` (never fetched: no
-                // extra requests) and stray `;` / `}`.
+                // extra requests).
                 Some(_) => pos = i + 1,
                 None => break,
             }
         }
     }
 
-    fn add_rule(&mut self, prelude: &str, body: &str, media: &[MediaList]) {
+    fn add_rule(&mut self, prelude: &str, body: &str, media: &[MediaList], base: Base<'_>) {
         let Some(selectors) = parse_selector_list(prelude) else { return };
         let mut decls = Vec::new();
-        parse_declarations_into(body, &mut decls);
+        parse_declarations_into(body, &mut decls, base);
         if decls.is_empty() {
             return;
+        }
+        let mut images = Vec::new();
+        for d in &decls {
+            decl_urls(&d.decl, &mut images);
         }
         let rule = self.rules.len() as u32;
         for (si, sel) in selectors.iter().enumerate() {
@@ -541,21 +613,11 @@ impl Stylesheet {
                 self.universal.push(entry);
             }
         }
-        self.rules.push(Rule { selectors, decls, media: media.to_vec() });
+        self.rules.push(Rule { selectors, decls, media: media.to_vec(), images });
     }
 
-    /// Every rule matching element `node`, for a viewport `width` CSS px
-    /// wide. `order_base` is added to rule indices so several sheets can
-    /// share one cascade order.
-    pub fn matching<'a>(
-        &'a self,
-        tree: &Tree<'_>,
-        node: NodeId,
-        width: f32,
-        order_base: u32,
-        out: &mut Vec<Matched<'a>>,
-    ) {
-        let Some(el) = tree.dom.element(node) else { return };
+    /// Rules that could match `el`, from the index, sorted and deduplicated.
+    fn candidates(&self, el: &Element) -> Vec<(u32, u32)> {
         let mut candidates: Vec<(u32, u32)> = self.universal.clone();
         if let Some(v) = el.id.as_ref().and_then(|id| self.by_id.get(id)) {
             candidates.extend_from_slice(v);
@@ -572,7 +634,53 @@ impl Stylesheet {
         // result would be the same but sorting keeps it deterministic anyway.
         candidates.sort_unstable();
         candidates.dedup();
-        for (rule, sel) in candidates {
+        candidates
+    }
+
+    /// The http(s) images of rules that apply to some element of the
+    /// document (or to its `::before`/`::after`), in document order of the
+    /// first element each applies to, appended to `out` unless already in
+    /// `seen`, until `out` holds `max`. Media queries are ignored, so what
+    /// is fetched never depends on the viewport; rules for states a static
+    /// page never has (`:hover`, ...) never match.
+    pub fn image_urls(&self, tree: &Tree<'_>, seen: &mut BTreeSet<String>, out: &mut Vec<Url>, max: usize) {
+        if self.rules.iter().all(|r| r.images.is_empty()) {
+            return;
+        }
+        let mut done = vec![false; self.rules.len()];
+        for node in 0..tree.dom.nodes.len() {
+            let Some(el) = tree.dom.element(node) else { continue };
+            for (rule, sel) in self.candidates(el) {
+                let r = &self.rules[rule as usize];
+                if done[rule as usize] || r.images.is_empty() || !r.selectors[sel as usize].matches(tree, node) {
+                    continue;
+                }
+                done[rule as usize] = true;
+                for u in &r.images {
+                    if out.len() >= max {
+                        return;
+                    }
+                    if seen.insert(u.as_str().to_owned()) {
+                        out.push((**u).clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every rule matching element `node` or one of its pseudo-elements,
+    /// for a viewport `width` CSS px wide. `order_base` is added to rule
+    /// indices so several sheets can share one cascade order.
+    pub fn matching<'a>(
+        &'a self,
+        tree: &Tree<'_>,
+        node: NodeId,
+        width: f32,
+        order_base: u32,
+        out: &mut Vec<Matched<'a>>,
+    ) {
+        let Some(el) = tree.dom.element(node) else { return };
+        for (rule, sel) in self.candidates(el) {
             let r = &self.rules[rule as usize];
             let s = &r.selectors[sel as usize];
             if r.media.iter().all(|m| m.matches(width)) && s.matches(tree, node) {
@@ -580,6 +688,7 @@ impl Stylesheet {
                     specificity: s.specificity,
                     order: order_base.saturating_add(rule),
                     decls: &r.decls,
+                    pseudo: s.pseudo,
                 });
             }
         }
@@ -1225,11 +1334,16 @@ fn parse_selector(s: &str, depth: usize) -> Option<Selector> {
     let mut cur = Compound::default();
     let mut cur_has = false;
     let mut pending: Option<Combinator> = None;
+    let mut pseudo_element = None;
     // Ids; classes, attributes and pseudo-classes; types.
     let mut spec = [0u32; 3];
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
+        if pseudo_element.is_some() {
+            // A pseudo-element ends the selector.
+            return None;
+        }
         if c.is_whitespace() {
             if cur_has {
                 compounds.push(std::mem::take(&mut cur));
@@ -1292,12 +1406,33 @@ fn parse_selector(s: &str, depth: usize) -> Option<Selector> {
             }
             ':' => {
                 i += 1;
-                // Pseudo-elements: generated content isn't drawn (yet), so the
-                // rule is dropped rather than applied to the element itself.
-                if chars.get(i) == Some(&':') {
-                    return None;
+                let double = chars.get(i) == Some(&':');
+                if double {
+                    i += 1;
                 }
                 let name = ident(&chars, &mut i)?.to_ascii_lowercase();
+                // `::before` and `::after` (also with CSS 2's single colon).
+                // Other pseudo-elements (`::first-line`, `::placeholder`, ...)
+                // can't be drawn, so their rules are dropped rather than
+                // applied to the element itself.
+                if double || matches!(name.as_str(), "before" | "after" | "first-line" | "first-letter") {
+                    let pe = match name.as_str() {
+                        "before" => PseudoElement::Before,
+                        "after" => PseudoElement::After,
+                        _ => return None,
+                    };
+                    // Not inside `:is()` / `:not()`.
+                    if depth > 0 {
+                        return None;
+                    }
+                    pseudo_element = Some(pe);
+                    spec[2] += 1;
+                    cur_has = true;
+                    while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+                        i += 1;
+                    }
+                    continue;
+                }
                 if chars.get(i) == Some(&'(') {
                     let close = close_paren(&chars, i)?;
                     let arg: String = chars[i + 1..close].iter().collect();
@@ -1350,7 +1485,7 @@ fn parse_selector(s: &str, depth: usize) -> Option<Selector> {
         return None;
     }
     let specificity = (spec[0].min(255) << 16) | (spec[1].min(255) << 8) | spec[2].min(255);
-    Some(Selector { compounds, combinators, specificity })
+    Some(Selector { compounds, combinators, pseudo: pseudo_element, specificity })
 }
 
 /// `:not()`, `:is()`, `:nth-child()`, ... with their specificity (ids,
@@ -1581,14 +1716,15 @@ fn string(chars: &[char], i: &mut usize, quote: char) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Declarations
 
-/// Parses the contents of a `style=""` attribute.
-pub(crate) fn parse_declarations(s: &str) -> Vec<Declaration> {
+/// Parses the contents of a `style=""` attribute; relative `url()`s
+/// resolve against `base`.
+pub(crate) fn parse_declarations(s: &str, base: Base<'_>) -> Vec<Declaration> {
     let mut out = Vec::new();
-    parse_declarations_into(&strip_comments(truncate(s, 64 * 1024)), &mut out);
+    parse_declarations_into(&strip_comments(truncate(s, 64 * 1024)), &mut out, base);
     out
 }
 
-fn parse_declarations_into(body: &str, out: &mut Vec<Declaration>) {
+fn parse_declarations_into(body: &str, out: &mut Vec<Declaration>, base: Base<'_>) {
     for part in split_top_level(body, b';').into_iter().take(MAX_DECLS_PER_BLOCK) {
         let Some(colon) = part.find(':') else { continue };
         let raw_name = part[..colon].trim();
@@ -1607,7 +1743,7 @@ fn parse_declarations_into(body: &str, out: &mut Vec<Declaration>) {
             let valid_name = !custom.is_empty()
                 && custom.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii());
             if valid_name && value.len() <= vars::MAX_VALUE_BYTES && !value.contains('{') {
-                let raw = RawDecl { name: raw_name.into(), value: value.into() };
+                let raw = RawDecl { name: raw_name.into(), value: value.into(), base: None };
                 out.push(Declaration { decl: Decl::Custom(Box::new(raw)), important });
             }
             continue;
@@ -1617,14 +1753,14 @@ fn parse_declarations_into(body: &str, out: &mut Vec<Declaration>) {
         }
         if vars::has_var(value) {
             // Substituted and parsed per element, if it is a property we know.
-            if !parse_substituted(&name, None).is_empty() {
-                let raw = RawDecl { name: name.into(), value: value.into() };
+            if !parse_substituted(&name, None, None).is_empty() {
+                let raw = RawDecl { name: name.into(), value: value.into(), base: base.cloned() };
                 out.push(Declaration { decl: Decl::Var(Box::new(raw)), important });
             }
             continue;
         }
         let mut decls = Vec::new();
-        parse_property(&name, value, &mut decls);
+        parse_property(&name, value, &mut decls, base);
         out.extend(decls.into_iter().map(|decl| Declaration { decl, important }));
     }
 }
@@ -1632,13 +1768,13 @@ fn parse_declarations_into(body: &str, out: &mut Vec<Declaration>) {
 /// Parses a property's value after `var()` substitution. `None` (a
 /// reference failed) or a value we can't parse leaves every longhand of the
 /// property `unset`: the declaration is invalid at computed-value time.
-pub(crate) fn parse_substituted(name: &str, value: Option<&str>) -> Vec<Decl> {
+pub(crate) fn parse_substituted(name: &str, value: Option<&str>, base: Base<'_>) -> Vec<Decl> {
     let mut out = Vec::new();
     if let Some(v) = value.map(str::trim).filter(|v| !v.is_empty() && !v.contains('{')) {
-        parse_property(name, v, &mut out);
+        parse_property(name, v, &mut out, base);
     }
     if out.is_empty() {
-        parse_property(name, "unset", &mut out);
+        parse_property(name, "unset", &mut out, None);
     }
     out
 }
@@ -1652,11 +1788,38 @@ fn wide_keyword(v: &str) -> Option<Wide> {
     }
 }
 
-fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>) {
+const BACKGROUND_ALL: [Prop; 8] = [
+    Prop::Background,
+    Prop::BgImage,
+    Prop::BgRepeat,
+    Prop::BgPosition,
+    Prop::BgSize,
+    Prop::BgOrigin,
+    Prop::BgClip,
+    Prop::BgAttachment,
+];
+
+fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>, base: Base<'_>) {
     let props: &[Prop] = match name {
         "display" => &[Prop::Display],
         "color" => &[Prop::Color],
-        "background-color" | "background" => &[Prop::Background],
+        "background-color" => &[Prop::Background],
+        "background" => &BACKGROUND_ALL,
+        "background-image" => &[Prop::BgImage],
+        "background-repeat" => &[Prop::BgRepeat],
+        "background-position" => &[Prop::BgPosition],
+        "background-size" | "-webkit-background-size" => &[Prop::BgSize],
+        "background-origin" | "-webkit-background-origin" => &[Prop::BgOrigin],
+        "background-clip" | "-webkit-background-clip" => &[Prop::BgClip],
+        "background-attachment" => &[Prop::BgAttachment],
+        "content" => &[Prop::Content],
+        "counter-reset" => &[Prop::Counters(CounterOp::Reset)],
+        "counter-increment" => &[Prop::Counters(CounterOp::Increment)],
+        "counter-set" => &[Prop::Counters(CounterOp::Set)],
+        "quotes" => &[Prop::Quotes],
+        "border-collapse" => &[Prop::BorderCollapse],
+        "table-layout" => &[Prop::TableLayout],
+        "caption-side" => &[Prop::CaptionSide],
         "font-size" => &[Prop::FontSize],
         "font-weight" => &[Prop::FontWeight],
         "font-style" => &[Prop::FontStyle],
@@ -1750,7 +1913,37 @@ fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>) {
         "display" => parse_display(&lower).map(Decl::Display),
         "color" => parse_color(&lower).map(Decl::Color),
         "background-color" => parse_color(&lower).map(Decl::Background),
-        "background" => Some(Decl::Background(parse_background(&lower))),
+        "background" => return values::background_shorthand(value, base, out),
+        "background-image"
+        | "background-repeat"
+        | "background-position"
+        | "background-size"
+        | "-webkit-background-size"
+        | "background-origin"
+        | "-webkit-background-origin"
+        | "background-clip"
+        | "-webkit-background-clip"
+        | "background-attachment" => values::background_longhand(name, value, base),
+        "content" => values::content(value, base),
+        "counter-reset" => values::counters(CounterOp::Reset, value),
+        "counter-increment" => values::counters(CounterOp::Increment, value),
+        "counter-set" => values::counters(CounterOp::Set, value),
+        "quotes" => values::quotes(value),
+        "border-collapse" => match lower.as_str() {
+            "collapse" => Some(Decl::BorderCollapse(true)),
+            "separate" => Some(Decl::BorderCollapse(false)),
+            _ => None,
+        },
+        "table-layout" => match lower.as_str() {
+            "fixed" => Some(Decl::TableFixed(true)),
+            "auto" => Some(Decl::TableFixed(false)),
+            _ => None,
+        },
+        "caption-side" => match lower.as_str() {
+            "top" | "block-start" => Some(Decl::CaptionBottom(false)),
+            "bottom" | "block-end" => Some(Decl::CaptionBottom(true)),
+            _ => None,
+        },
         "font-size" => parse_font_size(&lower).map(Decl::FontSize),
         "font-weight" => parse_font_weight(&lower).map(Decl::FontWeight),
         "font-style" => match lower.split_whitespace().next() {
@@ -1862,12 +2055,16 @@ fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>) {
             "content-box" => Some(Decl::BorderBox(false)),
             _ => None,
         },
-        "border-spacing" => lower
-            .split_whitespace()
-            .next()
-            .and_then(parse_length)
-            .filter(|l| non_negative(*l) && !matches!(l, Length::Pct(_) | Length::Auto))
-            .map(Decl::BorderSpacing),
+        "border-spacing" => {
+            let one =
+                |t: &str| parse_length(t).filter(|l| non_negative(*l) && !matches!(l, Length::Pct(_) | Length::Auto));
+            let vals: Option<Vec<Length>> = words(&lower).into_iter().map(one).collect();
+            match vals.as_deref() {
+                Some([s]) => Some(Decl::BorderSpacing(*s, *s)),
+                Some([h, v]) => Some(Decl::BorderSpacing(*h, *v)),
+                _ => None,
+            }
+        }
         "position" => match lower.as_str() {
             "static" => Some(Position::Static),
             "relative" => Some(Position::Relative),
@@ -2274,19 +2471,21 @@ pub(crate) fn parse_display(v: &str) -> Option<Display> {
         "inline" | "ruby" => Display::Inline,
         "contents" => Display::Contents,
         "inline-block" | "-webkit-inline-box" => Display::InlineBlock,
-        // Laid out as a block-level table: close enough without inline tables.
-        "inline-table" => Display::Table,
+        "inline-table" => Display::InlineTable,
         "inline-flex" | "-webkit-inline-flex" | "-ms-inline-flexbox" => Display::InlineFlex,
         "inline-grid" | "-ms-inline-grid" => Display::InlineGrid,
-        "block" | "-webkit-box" | "table-caption" => Display::Block,
+        "block" | "-webkit-box" => Display::Block,
         "flow-root" => Display::FlowRoot,
         "flex" | "-webkit-flex" | "-ms-flexbox" => Display::Flex,
         "grid" | "-ms-grid" => Display::Grid,
         "table" => Display::Table,
-        "table-row-group" | "table-header-group" | "table-footer-group" => Display::TableRowGroup,
+        "table-caption" => Display::TableCaption,
+        "table-row-group" => Display::TableRowGroup,
+        "table-header-group" => Display::TableHeaderGroup,
+        "table-footer-group" => Display::TableFooterGroup,
         "table-row" => Display::TableRow,
         "table-cell" => Display::TableCell,
-        "table-column" | "table-column-group" => Display::None,
+        "table-column" | "table-column-group" => Display::TableColumn,
         _ => return None,
     })
 }
@@ -2340,7 +2539,7 @@ pub(crate) fn parse_length(t: &str) -> Option<Length> {
 
 /// Layout never sees the viewport height (it must not influence the page,
 /// and the window is letterboxed anyway), so `vh` assumes a 16:9 viewport.
-const VH_PER_VW: f32 = 0.5625;
+pub(crate) const VH_PER_VW: f32 = 0.5625;
 const MAX_MATH_DEPTH: usize = 16;
 const MAX_MATH_TOKENS: usize = 256;
 
@@ -2690,33 +2889,6 @@ fn parse_font_shorthand(v: &str, out: &mut Vec<Decl>) {
         Decl::LineHeight(line_height),
         Decl::FontFamily(family),
     ]);
-}
-
-/// `background` shorthand: only its color matters to us. Images and
-/// gradients can't be drawn yet, so a gradient contributes its first color
-/// stop, which keeps light-on-gradient text readable.
-fn parse_background(v: &str) -> ColorValue {
-    let transparent = ColorValue::Rgba(Color { r: 0, g: 0, b: 0, a: 0 });
-    let mut first_stop = None;
-    for t in split_top_level(v, b' ') {
-        let t = t.trim().trim_end_matches(',');
-        if t.is_empty() {
-            continue;
-        }
-        if let Some(c) = parse_color(t) {
-            return c;
-        }
-        if first_stop.is_none()
-            && t.contains("gradient(")
-            && let Some(open) = t.find('(')
-        {
-            let inner = t[open + 1..].trim_end_matches(')');
-            first_stop = split_top_level(inner, b',')
-                .into_iter()
-                .find_map(|stop| split_top_level(stop.trim(), b' ').into_iter().find_map(|s| parse_color(s.trim())));
-        }
-    }
-    first_stop.unwrap_or(transparent)
 }
 
 pub(crate) fn parse_color(v: &str) -> Option<ColorValue> {
@@ -3075,7 +3247,7 @@ mod tests {
 
     #[test]
     fn parses_layout_properties() {
-        let decls = |css: &str| parse_declarations(css).into_iter().map(|d| d.decl).collect::<Vec<_>>();
+        let decls = |css: &str| parse_declarations(css, None).into_iter().map(|d| d.decl).collect::<Vec<_>>();
         assert_eq!(
             decls("border: 2px solid red"),
             [0, 1, 2, 3]
@@ -3160,10 +3332,30 @@ mod tests {
     }
 
     #[test]
+    fn pseudo_element_selectors() {
+        let pe = |s: &str| parse_selector(s, 0).map(|s| (s.pseudo, s.specificity));
+        assert_eq!(pe("p::before"), Some((Some(PseudoElement::Before), 2)));
+        assert_eq!(pe(".a:after"), Some((Some(PseudoElement::After), (1 << 8) | 1)));
+        assert_eq!(pe("::BEFORE "), Some((Some(PseudoElement::Before), 1)));
+        assert_eq!(pe("div > ::after"), Some((Some(PseudoElement::After), 2)));
+        assert_eq!(pe("p"), Some((None, 1)));
+        // They match the originating element, and say so.
+        let sheet = Stylesheet::parse("p::before { color: red } p { color: blue } p:hover::after { color: red }");
+        let dom = doc("<p id=p>x</p>");
+        let mut out = Vec::new();
+        sheet.matching(&Tree::new(&dom), by_id(&dom, "p"), 800.0, 0, &mut out);
+        let got: Vec<Option<PseudoElement>> = out.iter().map(|m| m.pseudo).collect();
+        assert_eq!(got, vec![Some(PseudoElement::Before), None]);
+    }
+
+    #[test]
     fn rejects_unsupported_selectors() {
         for bad in [
-            "p::before",
-            "a:before",
+            "p::first-line",
+            "a:first-letter",
+            "p::before span",
+            "p::before::after",
+            "::placeholder",
             "> a",
             "a > > b",
             "a + + b",
@@ -3188,7 +3380,7 @@ mod tests {
             assert!(parse_selector(bad, 0).is_none(), "{bad}");
         }
         // One bad selector drops the whole list, as CSS requires...
-        assert!(parse_selector_list("h1, p::after").is_none());
+        assert!(parse_selector_list("h1, p::selection").is_none());
         assert_eq!(parse_selector_list("h1, .x > p").unwrap().len(), 2);
         // ...but `:is()` and `:where()` forgive bad arguments.
         assert!(parse_selector(":is(p::before, a)", 0).is_some());
@@ -3419,11 +3611,13 @@ mod tests {
     fn stylesheet_skips_at_rules_and_garbage() {
         let sheet = Stylesheet::parse(
             "@import url(x.css); @media (max-width: 600px) { p { color: red } }
-             /* comment { } */ p { color: blue; margin: 1px 2px } ;;; }
-             garbage without block; h1, h2 { font-weight: bold !important }
+             /* comment { } */ p { color: blue; margin: 1px 2px } h1, h2 { font-weight: bold !important }
+             ;;; } garbage without block; h3 { color: red }
              a:hover { color: red } div { unknown-prop: 1; color: var(--x) }
              @font-face { font-family: x }",
         );
+        // The stray `;;; } garbage...` belongs to the `h3` selector, which
+        // is then invalid.
         assert_eq!(sheet.rules.len(), 5);
         assert_eq!(sheet.rules[0].media.len(), 1, "@media rules are kept, with their condition");
         assert_eq!(sheet.rules[1].decls.len(), 5);
@@ -3437,8 +3631,9 @@ mod tests {
         let d = parse_declarations(
             "--Main-Color: #ABC !important; --empty:; color: VAR(--x, red); margin: var(--a) 0;
              --bad name: 1; unknown: var(--x); -- : x; --x: {}",
+            None,
         );
-        let raw = |n: &str, v: &str| Box::new(RawDecl { name: n.into(), value: v.into() });
+        let raw = |n: &str, v: &str| Box::new(RawDecl { name: n.into(), value: v.into(), base: None });
         assert_eq!(
             d,
             vec![
@@ -3448,10 +3643,10 @@ mod tests {
                 Declaration { decl: Decl::Var(raw("margin", "var(--a) 0")), important: false },
             ]
         );
-        assert_eq!(parse_substituted("margin", Some("1px 2px")).len(), 4);
+        assert_eq!(parse_substituted("margin", Some("1px 2px"), None).len(), 4);
         // Invalid at computed-value time: every longhand is unset.
-        assert_eq!(parse_substituted("margin", Some("bogus")), parse_substituted("margin", None));
-        assert_eq!(parse_substituted("color", None), vec![Decl::Wide(Prop::Color, Wide::Unset)]);
+        assert_eq!(parse_substituted("margin", Some("bogus"), None), parse_substituted("margin", None, None));
+        assert_eq!(parse_substituted("color", None, None), vec![Decl::Wide(Prop::Color, Wide::Unset)]);
         let huge = format!("--h: {}", "x".repeat(vars::MAX_VALUE_BYTES + 1));
         assert!(Stylesheet::parse(&format!("p {{ {huge} }}")).rules.is_empty());
     }
@@ -3519,16 +3714,16 @@ mod tests {
 
     #[test]
     fn shorthands_expand() {
-        let d = parse_declarations("margin: 1px 2px 3px; padding: 4px; font: italic bold 12px/1.5 Georgia, serif");
+        let d =
+            parse_declarations("margin: 1px 2px 3px; padding: 4px; font: italic bold 12px/1.5 Georgia, serif", None);
         assert!(d.contains(&Declaration { decl: Decl::Margin(3, Length::Px(2.0)), important: false }));
         assert!(d.contains(&Declaration { decl: Decl::Padding(2, Length::Px(4.0)), important: false }));
         assert!(d.contains(&Declaration { decl: Decl::FontFamily(Family::Serif), important: false }));
         assert!(d.contains(&Declaration { decl: Decl::LineHeight(LineHeightValue::Number(1.5)), important: false }));
         assert!(d.contains(&Declaration { decl: Decl::Italic(true), important: false }));
-        let bg = parse_declarations("background: url(a.png) no-repeat #123456");
+        let bg = parse_declarations("background: url(a.png) no-repeat #123456", None);
         assert_eq!(bg[0].decl, Decl::Background(ColorValue::Rgba(Color::rgb(0x12, 0x34, 0x56))));
-        let grad = parse_declarations("background: linear-gradient(to right, #ff0000 0%, blue 100%)");
-        assert_eq!(grad[0].decl, Decl::Background(ColorValue::Rgba(Color::rgb(255, 0, 0))));
+        assert_eq!(bg.len(), 8, "every background longhand is set");
     }
 
     #[test]
@@ -3550,7 +3745,7 @@ mod tests {
         ];
         for i in inputs {
             let _ = Stylesheet::parse(i);
-            let _ = parse_declarations(i);
+            let _ = parse_declarations(i, None);
         }
         let deep = "(".repeat(100_000) + "{" + &"[".repeat(100_000);
         let _ = Stylesheet::parse(&deep);

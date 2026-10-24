@@ -8,7 +8,7 @@
 //! containing block, which is the whole page: without scripts a fixed
 //! overlay could never be dismissed, so it scrolls away with the page.
 
-use super::{BoxId, Ctx, Flow, Margin, Rect, clamp_extent, geometry};
+use super::{BoxId, Ctx, Flow, Margin, PHASE_FLOAT, Rect, clamp_extent, geometry};
 use crate::style::{Clear, Float, Position, Style};
 
 /// Floats one formatting context may hold; later ones are laid out where
@@ -72,11 +72,16 @@ impl Ctx<'_> {
         self.floats.last().map_or(f32::NEG_INFINITY, |f| f.bottom(clear))
     }
 
-    /// Moves the flow below the floats `clear` names.
-    pub(super) fn clear(&mut self, clear: Clear, flow: &mut Flow) {
+    /// Clearance for a box with top margin `mt` (CSS 2.1 9.5.2): if its
+    /// border edge would start above the floats `clear` names, it starts
+    /// at their bottom instead, and the margins above no longer collapse
+    /// with it.
+    pub(super) fn clear(&mut self, clear: Clear, mt: f32, flow: &mut Flow) {
         let bottom = self.floats_bottom(clear);
-        if bottom > flow.next() {
-            flow.y = bottom;
+        let mut m = flow.margin;
+        m.push(mt);
+        if bottom > flow.y + m.value() {
+            flow.y = bottom - mt;
             flow.margin = Margin::default();
         }
     }
@@ -91,7 +96,7 @@ impl Ctx<'_> {
         let [_, mr, _, ml] = g.margin;
         let bw = self.shrink_width(id, cb_w - ml - mr, cb_w);
         let outer_w = clamp_extent(bw + ml + mr);
-        let (outer_h, _, span) = self.layout_detached(id, bw, cb_w, None);
+        let (outer_h, _, span) = self.atomically(PHASE_FLOAT, |c| c.layout_detached(id, bw, cb_w, None));
         // Never above the current line, an earlier float, or what it clears.
         let floor = self.floats.last().map_or(f32::NEG_INFINITY, |f| {
             f.left.iter().chain(&f.right).map(|r| r.y).fold(f32::NEG_INFINITY, f32::max)
@@ -191,7 +196,7 @@ impl Ctx<'_> {
         self.cb_h = Some(cb.h);
         let (outer_h, _, span) = self.layout_detached(p.id, bw, cb.w, fixed_h);
         self.cb_h = saved;
-        let bh = (outer_h - mt - mb.max(0.0)).max(0.0);
+        let bh = (outer_h - mt - mb).max(0.0);
         let bx = match (left, right) {
             (Some(l), _) => cb.x + l + ml,
             (None, Some(r)) => cb.x + cb.w - r - mr - bw,

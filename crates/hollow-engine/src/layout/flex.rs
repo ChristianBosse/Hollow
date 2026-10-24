@@ -8,7 +8,7 @@
 //! growing in a column, only resize the item's own background and borders:
 //! block content doesn't move when its box gets taller.
 
-use super::{BoxId, Ctx, Kind, Len, Span, clamp_extent, geometry};
+use super::{BoxId, Ctx, Kind, Len, PHASE_INLINE, Span, clamp_extent, geometry};
 use crate::style::{Align, FlexDirection, Justify, Style};
 
 struct FlexItem {
@@ -107,7 +107,8 @@ impl Ctx<'_> {
         // were laid out to measure them and only change their height.
         for it in &mut items {
             if row {
-                let (_, baseline, span) = self.layout_detached(it.id, it.main, w, None);
+                // Flex items paint like inline-blocks.
+                let (_, baseline, span) = self.atomically(PHASE_INLINE, |c| c.layout_detached(it.id, it.main, w, None));
                 let d = self.deco[it.id];
                 it.cross = d.map_or(0.0, |d| d.rect.h);
                 if d.is_none() {
@@ -309,8 +310,8 @@ impl Ctx<'_> {
                 self.shrink_width(c, avail, w)
             };
             it.cross_auto = b.anon || !cs.width.is_definite();
-            let (outer_h, baseline, span) = self.layout_detached(c, cross, w, None);
-            let content = (outer_h - it.margin[0] - it.margin[2].max(0.0)).max(0.0);
+            let (outer_h, baseline, span) = self.atomically(PHASE_INLINE, |s| s.layout_detached(c, cross, w, None));
+            let content = (outer_h - it.margin[0] - it.margin[2]).max(0.0);
             it.cross = cross;
             it.baseline = baseline;
             it.span = Some(span);
