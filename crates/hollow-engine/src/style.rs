@@ -449,7 +449,13 @@ center { text-align: center }
 mark { background-color: yellow; color: black }
 fieldset { margin: 0 2px; padding: 0.35em 0.75em 0.625em }
 legend { padding: 0 2px }
-button { background-color: #e9e9ed; color: black }
+input, textarea, select, button { font-family: sans-serif; font-size: 13.333px }
+button { display: inline-block; text-align: center }
+input, textarea { border: 1px solid #767676; background-color: white; padding: 1px 2px; color: black }
+input[type=checkbox], input[type=radio] { border: 0; padding: 0; background-color: transparent; margin: 3px 3px 3px 4px }
+input[type=range], input[type=color], input[type=file], input[type=image] { border: 0; padding: 0; background-color: transparent }
+select { border: 1px solid #767676; background-color: #e9e9ed; padding: 1px 2px; color: black; box-sizing: border-box }
+button, input[type=submit], input[type=button], input[type=reset] { border: 1px solid #8f8f9d; border-radius: 4px; padding: 1px 6px; background-color: #e9e9ed; color: black; box-sizing: border-box }
 summary { font-weight: bold }
 "#;
 

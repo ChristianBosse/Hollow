@@ -1063,3 +1063,15 @@ fn forms_are_clicked_typed_drawn_and_submitted() {
         other => panic!("expected a submission, got {other:?}"),
     }
 }
+
+#[test]
+fn inline_buttons_and_submit_inputs_are_controls() {
+    let html = format!("{PLAIN}<form><button>Go now</button> <input type=submit value=Send></form>");
+    let doc = Document::parse(&html, &base());
+    let l = Layout::new(&doc, &Resources::new(), 400.0);
+    let forms = doc.forms();
+    let hits: Vec<bool> =
+        (0..200).map(|x| matches!(l.hit_test_forms(&forms, x as f32, 10.0), Some(HitTarget::Control(_)))).collect();
+    assert!(hits[20], "the button's label is clickable");
+    assert!(hits.iter().skip(80).any(|h| *h), "the submit input is clickable");
+}

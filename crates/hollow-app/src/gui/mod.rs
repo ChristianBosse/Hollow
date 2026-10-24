@@ -658,7 +658,7 @@ fn ring_icon() -> Option<Icon> {
 /// Never part of a release or `cargo xtask dist` build.
 ///
 /// `$HOLLOW_DEV_SCRIPT` drives the window without touching the desktop:
-/// `wait:SECS;goto:URL;scroll:DY;click:X,Y;middle:X,Y;newtab;tab:N;closetab;quit`
+/// `wait:SECS;goto:URL;scroll:DY;click:X,Y;middle:X,Y;newtab;tab:N;closetab;type:TEXT;enter;quit`
 /// (X, Y in window pixels), run through the same code paths as real input.
 #[cfg(feature = "dev-dump")]
 mod dev_dump {
@@ -679,6 +679,9 @@ mod dev_dump {
         NewTab,
         Tab(usize),
         CloseTab,
+        /// Text for the focused page field, then `enter` presses Enter there.
+        Type(String),
+        Enter,
         Quit,
     }
 
@@ -709,6 +712,8 @@ mod dev_dump {
                     "newtab" => Step::NewTab,
                     "tab" => Step::Tab(arg.parse().unwrap_or(0)),
                     "closetab" => Step::CloseTab,
+                    "type" => Step::Type(arg.to_owned()),
+                    "enter" => Step::Enter,
                     "quit" => Step::Quit,
                     _ => continue,
                 };
@@ -813,6 +818,16 @@ impl ApplicationHandler<UiEvent> for App {
                 dev_dump::Step::NewTab => self.new_tab_with_address(),
                 dev_dump::Step::Tab(i) => self.activate(i),
                 dev_dump::Step::CloseTab => self.close_tab(self.active),
+                dev_dump::Step::Type(text) => {
+                    if let Some(tab) = self.tab() {
+                        tab.send(Command::Key(KeyInput::Text(text)));
+                    }
+                }
+                dev_dump::Step::Enter => {
+                    if let Some(tab) = self.tab() {
+                        tab.send(Command::Key(KeyInput::Enter));
+                    }
+                }
                 dev_dump::Step::Quit => _event_loop.exit(),
             },
         }

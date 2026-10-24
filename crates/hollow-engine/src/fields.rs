@@ -155,7 +155,8 @@ impl Pen<'_> {
     fn field(&mut self, forms: &Forms, rect: Rect, node: NodeId, kind: FieldKind, f: FieldStyle, clip: u32) {
         let Some(control) = forms.control(node) else { return };
         let focused = forms.focused == Some(node);
-        let inner = Rect { x: rect.x + 1.0, y: rect.y + 1.0, w: (rect.w - 2.0).max(0.0), h: (rect.h - 2.0).max(0.0) };
+        // The marker is the content box; border and padding come from CSS.
+        let inner = rect;
         let (ascent, descent) = text::face(f.face).map_or((f.size * 0.8, f.size * 0.2), |face| {
             (face.ascent * face.scale(f.size), face.descent * face.scale(f.size))
         });
@@ -163,7 +164,7 @@ impl Pen<'_> {
             (FieldKind::Text | FieldKind::Area, Control::Text { kind: tk, value, caret, placeholder, .. }) => {
                 let inside = self.clip_inside(inner, clip);
                 let line_h = (ascent + descent).max(f.size * 1.2);
-                let pad = 3.0;
+                let pad = 1.0;
                 let shown: String = match tk {
                     TextKind::Password => "\u{2022}".repeat(value.chars().count().min(MAX_SHOWN)),
                     _ => value.chars().take(MAX_SHOWN).collect(),
@@ -221,11 +222,11 @@ impl Pen<'_> {
             (FieldKind::List, Control::Select { options, selected, .. }) => {
                 let inside = self.clip_inside(inner, clip);
                 let row_h = f.size * 1.2;
-                let rows = ((inner.h - 2.0) / row_h).floor().max(1.0) as usize;
+                let rows = (inner.h / row_h).floor().max(1.0) as usize;
                 // Show the first chosen option's row, as browsers scroll to it.
                 let first = selected.iter().position(|s| *s).unwrap_or(0).saturating_sub(rows - 1);
                 for (row, (o, on)) in options.iter().zip(selected).enumerate().skip(first).take(rows) {
-                    let y = inner.y + 1.0 + (row - first) as f32 * row_h;
+                    let y = inner.y + (row - first) as f32 * row_h;
                     let mut style = f;
                     if *on {
                         let band = Rect { x: inner.x, y, w: inner.w, h: row_h };
@@ -250,7 +251,9 @@ impl Pen<'_> {
             _ => {}
         }
         if focused {
-            let ring = Rect { x: rect.x - 1.0, y: rect.y - 1.0, w: rect.w + 2.0, h: rect.h + 2.0 };
+            // Around the UA border and padding (3 px) for text fields.
+            let out = if matches!(kind, FieldKind::Check | FieldKind::Radio) { 1.0 } else { 4.0 };
+            let ring = Rect { x: rect.x - out, y: rect.y - out, w: rect.w + 2.0 * out, h: rect.h + 2.0 * out };
             let radius = if kind == FieldKind::Radio { ring.w.min(ring.h) / 2.0 } else { 2.0 };
             self.push(DisplayItem::Round { rect: ring, radius, stroke: 2.0, color: ACCENT }, clip);
         }
@@ -300,8 +303,8 @@ pub(crate) fn list_box_row(laid: &Laid, forms: &Forms, node: NodeId, y: f32) -> 
     })?;
     let Some(Control::Select { options, selected, .. }) = forms.control(node) else { return None };
     let row_h = size * 1.2;
-    let rows = ((rect.h - 4.0) / row_h).floor().max(1.0) as usize;
+    let rows = (rect.h / row_h).floor().max(1.0) as usize;
     let first = selected.iter().position(|s| *s).unwrap_or(0).saturating_sub(rows - 1);
-    let row = first + ((y - rect.y - 2.0) / row_h).floor().max(0.0) as usize;
+    let row = first + ((y - rect.y) / row_h).floor().max(0.0) as usize;
     (row < options.len()).then_some(row)
 }

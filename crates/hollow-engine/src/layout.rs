@@ -129,6 +129,8 @@ enum Item {
     Atomic {
         boxid: BoxId,
         style: NodeId,
+        /// The box as a whole is a link or a control (padding included).
+        link: Option<u32>,
     },
     /// An absolutely positioned box. In the line it only marks its static
     /// position; it is laid out with its containing block.
@@ -151,7 +153,10 @@ impl Item {
     }
     fn link(&self) -> Option<u32> {
         match self {
-            Item::Text { link, .. } | Item::Image { link, .. } | Item::Field { link, .. } => *link,
+            Item::Text { link, .. }
+            | Item::Image { link, .. }
+            | Item::Field { link, .. }
+            | Item::Atomic { link, .. } => *link,
             _ => None,
         }
     }
@@ -630,7 +635,7 @@ impl<'a> Builder<'a> {
                             || self.dom.nodes[child].url.as_ref().and_then(|u| self.image_id(u)).is_some()) =>
                 {
                     if let Some(b) = self.build_level(child, Display::InlineBlock, depth + 1, None, block_ctx) {
-                        items.push(Item::Atomic { boxid: b, style: child });
+                        items.push(Item::Atomic { boxid: b, style: child, link });
                         self.last_space = false;
                     }
                 }
@@ -640,7 +645,7 @@ impl<'a> Builder<'a> {
                     if replaced {
                         self.inline_element(container, child, el, blocks, items, cctx, depth);
                     } else if let Some(b) = self.build_level(child, display, depth + 1, None, block_ctx) {
-                        items.push(Item::Atomic { boxid: b, style: child });
+                        items.push(Item::Atomic { boxid: b, style: child, link });
                         self.last_space = false;
                     }
                 }
@@ -663,7 +668,7 @@ impl<'a> Builder<'a> {
                     }
                     if let Some(b) = self.build_table(node, true, &kids[start..i], depth + 1, block_ctx) {
                         if inline {
-                            items.push(Item::Atomic { boxid: b, style: node });
+                            items.push(Item::Atomic { boxid: b, style: node, link: ctx.link });
                             self.last_space = false;
                         } else {
                             blocks.push(b);
@@ -782,7 +787,7 @@ impl<'a> Builder<'a> {
                     "hidden" | "image" | "file" | "range" | "color" => {}
                     _ => {
                         self.last_space = false;
-                        let h = (st.font_size * 1.25).max(1.0) + 4.0;
+                        let h = (st.font_size * 1.25).max(1.0);
                         items.push(Item::Field {
                             w: FIELD_WIDTH,
                             h,
@@ -797,20 +802,20 @@ impl<'a> Builder<'a> {
                 self.last_space = false;
                 let rows = el.attr("rows").and_then(|r| r.trim().parse::<f32>().ok()).unwrap_or(2.0).clamp(1.0, 100.0);
                 let cols = el.attr("cols").and_then(|c| c.trim().parse::<f32>().ok()).unwrap_or(20.0).clamp(1.0, 500.0);
-                let (w, h) = (cols * st.font_size * 0.55 + 6.0, rows * st.font_size * 1.2 + 6.0);
+                let (w, h) = (cols * st.font_size * 0.55, rows * st.font_size * 1.2);
                 items.push(Item::Field { w, h, style: node, kind: FieldKind::Area, link: ctx.link });
             }
             "select" => {
                 self.last_space = false;
                 // Wide enough for the longest option, as browsers size it.
-                let w = (self.widest_option(node) as f32 * st.font_size * 0.55 + 28.0).clamp(40.0, 480.0);
+                let w = (self.widest_option(node) as f32 * st.font_size * 0.55 + 20.0).clamp(40.0, 480.0);
                 // `multiple` or `size` > 1 is a list box showing several rows.
                 let size = el.attr("size").and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
                 let rows = if el.attr("multiple").is_some() { if size == 0 { 4 } else { size } } else { size };
                 let (h, kind) = if rows > 1 {
-                    ((rows.min(100) as f32 * st.font_size * 1.2) + 4.0, FieldKind::List)
+                    (rows.min(100) as f32 * st.font_size * 1.2, FieldKind::List)
                 } else {
-                    ((st.font_size * 1.25).max(1.0) + 4.0, FieldKind::Select)
+                    ((st.font_size * 1.25).max(1.0), FieldKind::Select)
                 };
                 items.push(Item::Field { w, h, style: node, kind, link: ctx.link });
             }
@@ -2190,15 +2195,18 @@ impl Ctx<'_> {
             Item::Field { kind, style, .. } => {
                 let st = &self.styles[*style];
                 let border = Color::rgb(0x76, 0x76, 0x76);
-                let fill = if *kind == FieldKind::Select { Color::rgb(0xe9, 0xe9, 0xed) } else { Color::WHITE };
+                let fill = Color::WHITE;
                 let inner = Rect { x: rect.x + 1.0, y: rect.y + 1.0, w: rect.w - 2.0, h: rect.h - 2.0 };
+                // Text fields and selects get their border and background
+                // from the UA stylesheet, so pages can restyle them; check
+                // boxes and radio buttons draw their own.
                 if *kind == FieldKind::Radio {
                     let r = rect.w.min(rect.h) / 2.0;
                     self.push(DisplayItem::Round { rect, radius: r, stroke: 0.0, color: border });
                     if inner.w > 0.0 && inner.h > 0.0 {
                         self.push(DisplayItem::Round { rect: inner, radius: r - 1.0, stroke: 0.0, color: fill });
                     }
-                } else {
+                } else if *kind == FieldKind::Check {
                     self.push(DisplayItem::Rect { rect, color: border });
                     if inner.w > 0.0 && inner.h > 0.0 {
                         self.push(DisplayItem::Rect { rect: inner, color: fill });
@@ -2518,10 +2526,16 @@ impl Ctx<'_> {
                 }
                 continue;
             }
-            if let FragKind::Object { base, .. } = f.kind
+            if let FragKind::Object { base, h } = f.kind
                 && let Some(m) = &measured[f.item as usize]
             {
-                // Inline-blocks draw themselves (and their own links).
+                // Inline-blocks draw themselves (and their own links); a
+                // button or link that is one is clickable all over.
+                if let Some(link) = item.link()
+                    && st.visible
+                {
+                    self.links.push((Rect { x: fx, y: by - base, w: f.w, h }, link));
+                }
                 let span = m.span.clone();
                 self.shift_span(&span, fx, by - base);
                 continue;
