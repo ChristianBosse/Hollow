@@ -19,13 +19,28 @@ pub(crate) enum Family {
     Sans,
     Serif,
     Mono,
+    /// A font registered with [`register_test_fonts`] (index into them).
+    #[cfg(feature = "test-fonts")]
+    Test(u8),
 }
 
-/// Index into [`faces`]: `family * 4 + bold * 2 + italic`.
+/// Index into [`faces`]: `family * 4 + bold * 2 + italic` for the bundled
+/// faces; test fonts follow them, one face each.
 pub(crate) type FaceId = u8;
 
+/// Number of bundled faces (test fonts come after them).
+#[cfg(feature = "test-fonts")]
+const BUNDLED_FACES: u8 = 12;
+
 pub(crate) fn face_id(family: Family, bold: bool, italic: bool) -> FaceId {
-    (family as u8) * 4 + (bold as u8) * 2 + italic as u8
+    let family = match family {
+        Family::Sans => 0,
+        Family::Serif => 1,
+        Family::Mono => 2,
+        #[cfg(feature = "test-fonts")]
+        Family::Test(i) => return BUNDLED_FACES + i,
+    };
+    family * 4 + (bold as u8) * 2 + italic as u8
 }
 
 /// A font plus the metrics layout needs, all in font units.
@@ -80,7 +95,8 @@ impl Face {
     }
 }
 
-/// All twelve bundled faces, in [`face_id`] order. Parsed once per process.
+/// All twelve bundled faces (then any test fonts), in [`face_id`] order.
+/// Parsed once per process.
 pub(crate) fn faces() -> &'static [Face] {
     static FACES: OnceLock<Vec<Face>> = OnceLock::new();
     FACES.get_or_init(|| {
@@ -101,8 +117,42 @@ pub(crate) fn faces() -> &'static [Face] {
         ];
         // The fonts are compiled in, so failing to parse one is a build defect;
         // substitute the regular sans face rather than panicking anyway.
-        data.iter().filter_map(|d| Face::new(d).or_else(|| Face::new(data[0]))).collect()
+        #[cfg_attr(not(feature = "test-fonts"), allow(unused_mut))]
+        let mut faces: Vec<Face> = data.iter().filter_map(|d| Face::new(d).or_else(|| Face::new(data[0]))).collect();
+        #[cfg(feature = "test-fonts")]
+        faces.extend(test_fonts().iter().filter_map(|(_, d)| Face::new(d).or_else(|| Face::new(data[0]))));
+        faces
     })
+}
+
+/// Fonts registered for test suites, as (lower-case family name, data).
+/// Frozen by the first use of [`faces`].
+#[cfg(feature = "test-fonts")]
+static TEST_FONTS: OnceLock<Vec<(String, &'static [u8])>> = OnceLock::new();
+
+#[cfg(feature = "test-fonts")]
+fn test_fonts() -> &'static [(String, &'static [u8])] {
+    TEST_FONTS.get_or_init(Vec::new)
+}
+
+/// See [`crate::register_test_fonts`].
+#[cfg(feature = "test-fonts")]
+pub(crate) fn register_test_fonts(fonts: Vec<(String, Vec<u8>)>) -> bool {
+    if fonts.len() > usize::from(u8::MAX - BUNDLED_FACES)
+        || fonts.iter().any(|(_, d)| Font::new(d.clone(), 0).is_none())
+    {
+        return false;
+    }
+    // Leaked once per process: faces borrow their data for 'static.
+    let fonts = fonts.into_iter().map(|(name, data)| (name.to_ascii_lowercase(), &*data.leak())).collect();
+    TEST_FONTS.set(fonts).is_ok()
+}
+
+/// The test font registered as `name` (lower case), if any.
+#[cfg(feature = "test-fonts")]
+pub(crate) fn test_family(name: &str) -> Option<Family> {
+    let i = test_fonts().iter().position(|(n, _)| n == name)?;
+    u8::try_from(i).ok().map(Family::Test)
 }
 
 pub(crate) fn face(id: FaceId) -> Option<&'static Face> {

@@ -39,7 +39,7 @@ target/release/hollow.exe fetch https://check.torproject.org/
 | `hollow-net` | `hollow-net.exe` | The only process with sockets: Arti (Tor), rustls, HTTP |
 | `hollow-fortress` | `hollow-fortress.exe` | Renderer: no network, LPAC, Win32k lockdown, ACG, CIG, one process per page |
 | `hollow-engine` | — | Fortress engine: HTML + CSS subset → layout → pixels, CPU-only, bundled fonts, deterministic |
-| `xtask` | — | Developer checks: `dist`, `repro-check`, `leak-test`, `trace-test` |
+| `xtask` | — | Developer checks: `dist`, `repro-check`, `leak-test`, `trace-test`, `wpt` |
 | `hollow-ipc` | — | Message types, framing, size limits, validation |
 | `hollow-sandbox` | — | AppContainer/LPAC launch, mitigation policies, job objects (the only crate with `unsafe`) |
 
@@ -74,8 +74,9 @@ GPL-3.0-or-later; the full text is in [LICENSE](LICENSE). Small standalone libra
 | `cargo xtask repro-check` | Freezes the sources into two copies at different paths (under `%TEMP%\hollow-repro-check`), builds each from scratch into `target/xtask-a` and `target/xtask-b` with the `dist` settings, and compares `hollow.exe`, `hollow-net.exe`, `hollow-fortress.exe` (TRUST-02) | Any hash differs |
 | `cargo xtask leak-test` | Runs `hollow fetch https://check.torproject.org/` and polls the TCP/UDP tables with owning PIDs every ~10 ms (P1, host edition of TRUST-06) | `hollow.exe` or `hollow-fortress.exe` owns any socket; `hollow-net.exe` owns a UDP or listening socket or connects to anything but a Tor relay ORPort, an Arti fallback dir or a directory authority; the fetch fails; the page doesn't say "Congratulations" |
 | `cargo xtask trace-test` | Snapshots files, the HKCU registry and the ACLs of the binaries before and after `hollow fetch https://check.torproject.org/`, and polls Hollow's AppContainer state while it runs (P5, host edition) | Anything new or changed matches Hollow's names, Arti's files or Hollow's AppContainer SIDs; a new AppContainer profile (`%LOCALAPPDATA%\Packages`, registry `Mappings`/`Storage`) is left; an ACE for a Hollow SID remains, or any ACE was added, on `hollow*.exe` or their folder; `%SystemRoot%\hollow-ram-only-never-created` exists; Hollow writes into its working directory; no Hollow profile was seen during the session; the fetch fails; no "Congratulations" |
+| `cargo xtask wpt` | Runs the Web Platform Tests reftests in `target/wpt` with the engine in-process at 800x600 (see below) | A test listed in `tests/wpt/expected.txt` no longer passes |
 
-All four pass `--locked` to cargo (`--unlocked` to allow `Cargo.lock` updates). `leak-test` and `trace-test` take `--url`, `--timeout <secs>`, `--no-build` (reuse `target/dist`) and `--bin-dir <dir>`.
+`dist`, `repro-check`, `leak-test` and `trace-test` pass `--locked` to cargo (`--unlocked` to allow `Cargo.lock` updates). `leak-test` and `trace-test` take `--url`, `--timeout <secs>`, `--no-build` (reuse `target/dist`) and `--bin-dir <dir>`.
 
 ### Reproducible builds
 
@@ -122,3 +123,11 @@ Limits, also printed on every run:
 - Only the listed roots are scanned. A file counts as changed when its size or timestamp changes, not its content. The `Packages` folder's own timestamp still shows that some profile existed.
 - Other programs write while the test runs, and only their Hollow-pattern writes fail the test. A Hollow write with an unrelated-looking name inside a noise-filtered folder would be missed.
 - `--bin-dir` pointing at a folder that another build writes into during the run (e.g. `target/release`) makes the binaries' folder look changed.
+
+### Web Platform Tests
+
+`cargo xtask wpt --fetch` makes a shallow, sparse checkout of [web-platform-tests](https://github.com/web-platform-tests/wpt) at the commit pinned in `WPT_COMMIT` (`crates/xtask/src/wpt.rs`) in `target/wpt`: the CSS 2.1, flexbox, grid, positioning, tables, backgrounds, content, pseudo, selectors, text and writing-modes suites plus `fonts`, `css/support`, `css/reference` and `images`. After that, `cargo xtask wpt` runs every reftest there (about 60 s on 16 threads; `cargo run --release -p xtask -- wpt` takes about 4 s) and prints the pass rate per area (`css/CSS2/<chapter>`, else `css/<spec>`), then the REGRESSIONS (tests in `tests/wpt/expected.txt` that no longer pass, which fail the run) and NEW PASSES. Every engine change should keep it green; when a change makes tests pass (or fail on purpose), `--update` rewrites `expected.txt`, which goes into the same commit.
+
+Options: `--filter <path prefix>` (e.g. `css/CSS2/floats`; `--update` then only touches that part of `expected.txt`), `--jobs <n>`, `--save <dir>` (PNGs of each failing test and its reference), `--compare <dir>` (per-area pass rates next to browsers' wpt.fyi summary files `<browser>.json` in `<dir>`, on the tests every browser ran). Full results go to `target/wpt-results.json`.
+
+How tests are run: pages are served from the checkout as `http://web-platform.test/<path>`, so relative and root-relative stylesheets and images load. A test passes if it matches one of its `rel=match` references and none of its `rel=mismatch` ones, in the top 800x600 CSS px. Without a `<meta name=fuzzy>`, a match allows up to 40 pixels whose channels differ by more than 8 (the engine's antialiasing is not a browser's); with one, its ranges are checked as wptrunner does. `.xht`/`.xhtml`/`.xml` files go through a pre-pass for what the HTML parser does differently from XML (CDATA, `<div/>`, `</br>`, `<?xml-stylesheet?>`), but implied elements and case sensitivity still differ. Tests with `<script>`, `class=reftest-wait` or a missing reference, and print reftests, are skipped and counted. Each test has 20 s; a slower one is recorded as a timeout and its worker replaced. The `Ahem` test font is registered through hollow-engine's non-default `test-fonts` feature, which only xtask enables; Hollow itself only ever uses the bundled fonts.
