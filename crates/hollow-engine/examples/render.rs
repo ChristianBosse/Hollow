@@ -46,6 +46,7 @@ fn main() -> ExitCode {
     let base = url::Url::parse(page).expect("page URL");
     let started = std::time::Instant::now();
     let doc = Document::parse(&html, &base);
+    let parsed = started.elapsed();
     let mut resources = Resources::new();
     let local = |url: &url::Url| {
         if let Some((_, file)) = manifest.iter().find(|(u, _)| u == url.as_str()) {
@@ -60,7 +61,8 @@ fn main() -> ExitCode {
             eprintln!("stylesheet {url}: {result:?}");
         }
     }
-    for url in doc.image_urls() {
+    // Images used by the linked stylesheets are only known once those are in.
+    for url in doc.image_urls().into_iter().chain(doc.stylesheet_image_urls(&resources)) {
         if let Some(bytes) = local(&url) {
             match resources.insert_image(&url, &bytes) {
                 Ok((w, h)) => eprintln!("image {url}: {w}x{h}"),
@@ -68,16 +70,20 @@ fn main() -> ExitCode {
             }
         }
     }
+    let laid = std::time::Instant::now();
     let layout = Layout::new(&doc, &resources, width);
-    let laid_out = started.elapsed();
+    let laid_out = laid.elapsed();
+    let painted = std::time::Instant::now();
     let frame = layout.paint(scroll, (layout.height() - scroll).max(1.0).min(max_height), scale);
     eprintln!(
-        "title: {:?}, height: {} css px, frame {}x{}, layout {:?}, total {:?}",
+        "title: {:?}, height: {} css px, frame {}x{}, parse {:?}, layout {:?}, paint {:?}, total {:?}",
         doc.title(),
         layout.height(),
         frame.width,
         frame.height,
+        parsed,
         laid_out,
+        painted.elapsed(),
         started.elapsed()
     );
     if let Err(e) = write_png(Path::new(&args[1]), &frame) {

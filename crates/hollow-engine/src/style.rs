@@ -5,10 +5,13 @@
 //! containing block.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::css::{
-    self, Calc, Color, ColorValue, Decl, Declaration, FontSize, FontWeight, Length, LineHeightValue, Matched,
-    MediaList, Prop, Stylesheet, Wide,
+    self, Base, BgSize, BoxArea, Calc, Color, ColorValue, ContentItem, CounterList, Decl, Declaration, FontSize,
+    FontWeight, Image, Length, LineHeightValue, Matched, MediaList, Prop, PseudoElement, QuoteList, Repeat, Stylesheet,
+    Wide,
 };
 pub(crate) use crate::css::{Align, Clear, FlexDirection, Float, Justify, Position};
 use crate::dom::{Dom, Element, NodeData, NodeId};
@@ -31,9 +34,15 @@ pub(crate) enum Display {
     Grid,
     InlineGrid,
     Table,
+    InlineTable,
+    TableCaption,
     TableRowGroup,
+    TableHeaderGroup,
+    TableFooterGroup,
     TableRow,
     TableCell,
+    /// `table-column` and `table-column-group`, which generate no boxes.
+    TableColumn,
 }
 
 impl Display {
@@ -44,10 +53,44 @@ impl Display {
             Display::Inline | Display::InlineBlock => Display::Block,
             Display::InlineFlex => Display::Flex,
             Display::InlineGrid => Display::Grid,
-            Display::TableRowGroup | Display::TableRow | Display::TableCell => Display::Block,
+            Display::InlineTable => Display::Table,
+            d if d.is_table_internal() => Display::Block,
             d => d,
         }
     }
+
+    /// The parts of a table, which need a table around them (CSS 2.1 §17.2.1).
+    pub fn is_table_internal(self) -> bool {
+        matches!(
+            self,
+            Display::TableCaption
+                | Display::TableRowGroup
+                | Display::TableHeaderGroup
+                | Display::TableFooterGroup
+                | Display::TableRow
+                | Display::TableCell
+                | Display::TableColumn
+        )
+    }
+
+    pub fn is_row_group(self) -> bool {
+        matches!(self, Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup)
+    }
+}
+
+/// One background image layer, with its lengths computed.
+#[derive(Clone, Debug)]
+pub(crate) struct BgLayer {
+    pub image: Image,
+    pub repeat: [Repeat; 2],
+    /// Percentages refer to the free space, as `background-position` says.
+    pub position: [Length; 2],
+    pub size: BgSize,
+    pub origin: BoxArea,
+    pub clip: BoxArea,
+    /// `background-attachment: fixed`: positioned against the page, since
+    /// fixed things scroll with it in Hollow.
+    pub fixed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -174,10 +217,24 @@ pub(crate) struct Style {
     pub list_style: ListStyle,
     pub visible: bool,
     pub text_transform: TextTransform,
-    pub border_spacing: f32,
+    /// Horizontal, vertical.
+    pub border_spacing: [f32; 2],
+    pub border_collapse: bool,
+    pub caption_bottom: bool,
+    /// `None` is `auto`.
+    pub quotes: Option<QuoteList>,
     // Not inherited.
     pub display: Display,
     pub background: Option<Color>,
+    /// Image layers, top first; `None` when there are none.
+    pub bg_layers: Option<Arc<[BgLayer]>>,
+    /// The box the background color fills: the bottom layer's clip.
+    pub bg_color_clip: BoxArea,
+    /// `None` for `normal` / `none`.
+    pub content: Option<Arc<[ContentItem]>>,
+    /// `counter-reset`, `counter-increment`, `counter-set`; `None` is `none`.
+    pub counters: [Option<CounterList>; 3],
+    pub table_fixed: bool,
     /// Text decorations propagate to all descendants, so these are the union
     /// of the element's own and its ancestors'.
     pub underline: bool,
@@ -237,9 +294,17 @@ impl Style {
             list_style: ListStyle::Disc,
             visible: true,
             text_transform: TextTransform::None,
-            border_spacing: 0.0,
+            border_spacing: [0.0; 2],
+            border_collapse: false,
+            caption_bottom: false,
+            quotes: None,
             display: Display::Inline,
             background: None,
+            bg_layers: None,
+            bg_color_clip: BoxArea::Border,
+            content: None,
+            counters: [None, None, None],
+            table_fixed: false,
             underline: false,
             line_through: false,
             margin: [Len::Px(0.0); 4],
@@ -291,6 +356,9 @@ impl Style {
             visible: parent.visible,
             text_transform: parent.text_transform,
             border_spacing: parent.border_spacing,
+            border_collapse: parent.border_collapse,
+            caption_bottom: parent.caption_bottom,
+            quotes: parent.quotes.clone(),
             ..Style::initial()
         }
     }
@@ -336,13 +404,18 @@ legend, listing, main, p, plaintext, pre, search, xmp, article, aside, h1, h2, h
 nav, section, dir, dd, dl, dt, menu, ol, ul, fieldset, details, summary, optgroup, address, frameset, frame
 { display: block }
 li { display: list-item }
-table { display: table; border-spacing: 2px; box-sizing: border-box }
-caption { display: block; text-align: center }
-thead, tbody, tfoot { display: table-row-group }
-tr { display: table-row }
-td, th { display: table-cell; padding: 1px; vertical-align: middle }
+table { display: table; border-spacing: 2px; border-collapse: separate; box-sizing: border-box }
+caption { display: table-caption; text-align: center }
+thead { display: table-header-group; vertical-align: middle }
+tbody { display: table-row-group; vertical-align: middle }
+tfoot { display: table-footer-group; vertical-align: middle }
+tr { display: table-row; vertical-align: inherit }
+td, th { display: table-cell; padding: 1px; vertical-align: inherit }
 th { font-weight: bold; text-align: center }
-col, colgroup { display: none }
+col { display: table-column }
+colgroup { display: table-column-group }
+q::before { content: open-quote }
+q::after { content: close-quote }
 body { margin: 8px }
 p, dl, multicol { margin: 1em 0 }
 blockquote, figure { margin: 1em 40px }
@@ -412,18 +485,34 @@ pub(crate) struct AuthorSheet<'a> {
     pub media: Option<&'a MediaList>,
 }
 
-/// Computes a style for every node, for a viewport `width` CSS px wide.
-/// Text nodes get their parent's style, which is what layout uses for them.
-pub(crate) fn compute(dom: &Dom, ua: &Stylesheet, author: &[AuthorSheet<'_>], width: f32) -> Vec<Style> {
+/// Pseudo-elements one document may generate; later ones are dropped.
+const MAX_PSEUDO_ELEMENTS: usize = 50_000;
+
+/// Computed styles of one document at one viewport width.
+pub(crate) struct Styles {
+    /// One per DOM node (text nodes get their parent's, which is what
+    /// layout uses for them), then one per generated pseudo-element. Layout
+    /// refers to pseudo-elements by these indices, as if they were nodes.
+    pub all: Vec<Style>,
+    /// The `::before` and `::after` of elements that generate them.
+    pub pseudo: BTreeMap<NodeId, [Option<usize>; 2]>,
+}
+
+/// Computes a style for every node and generated pseudo-element, for a
+/// viewport `width` CSS px wide.
+pub(crate) fn compute(dom: &Dom, ua: &Stylesheet, author: &[AuthorSheet<'_>], width: f32) -> Styles {
     let author: Vec<&Stylesheet> =
         author.iter().filter(|s| s.media.is_none_or(|m| m.matches(width))).map(|s| s.sheet).collect();
     static QUIRKS: std::sync::OnceLock<Stylesheet> = std::sync::OnceLock::new();
     let quirks = dom.quirks.then(|| QUIRKS.get_or_init(quirks_sheet));
     let mut styles: Vec<Style> = Vec::with_capacity(dom.nodes.len());
+    let mut generated: Vec<(NodeId, PseudoElement, Style)> = Vec::new();
     let mut root_font_size = DEFAULT_FONT_SIZE;
     let mut matched: Vec<Matched<'_>> = Vec::new();
+    let mut for_pseudo: Vec<Matched<'_>> = Vec::new();
     let tree = css::Tree::new(dom);
     let mut custom = vars::Custom::new(dom.nodes.len());
+    let base = Some(&dom.base);
     // The arena is in document order, so a parent is always computed before
     // its children and ancestors can be gathered by walking parent links.
     for (id, node) in dom.nodes.iter().enumerate() {
@@ -442,13 +531,37 @@ pub(crate) fn compute(dom: &Dom, ua: &Stylesheet, author: &[AuthorSheet<'_>], wi
                 for (i, sheet) in author.iter().enumerate() {
                     sheet.matching(&tree, id, width, (i as u32 + 1).saturating_mul(1 << 16), &mut matched);
                 }
-                let hints = presentational_hints(el, &chain);
-                let inline = el.attr("style").map(css::parse_declarations).unwrap_or_default();
-                let s = cascade(&parent, &matched, ua_count, &hints, &inline, root_font_size, width, |decls| {
+                // Rules for the pseudo-elements go aside, in the same order.
+                for_pseudo.clear();
+                let mut own_ua = ua_count;
+                if matched.iter().any(|m| m.pseudo.is_some()) {
+                    own_ua = matched[..ua_count].iter().filter(|m| m.pseudo.is_none()).count();
+                    for_pseudo.extend(matched.iter().filter(|m| m.pseudo.is_some()).copied());
+                    matched.retain(|m| m.pseudo.is_none());
+                }
+                let hints = presentational_hints(el, &chain, base);
+                let inline = el.attr("style").map(|s| css::parse_declarations(s, base)).unwrap_or_default();
+                let s = cascade(&parent, &matched, own_ua, &hints, &inline, root_font_size, width, |decls| {
                     custom.apply(id, node.parent, decls)
                 });
                 if el.name == "html" && node.parent.is_some_and(|p| matches!(dom.nodes[p].data, NodeData::Root)) {
                     root_font_size = s.font_size;
+                }
+                for pe in [PseudoElement::Before, PseudoElement::After] {
+                    if generated.len() >= MAX_PSEUDO_ELEMENTS || !for_pseudo.iter().any(|m| m.pseudo == Some(pe)) {
+                        continue;
+                    }
+                    // UA rules come first in `for_pseudo`, as in `matched`.
+                    let list: Vec<Matched<'_>> = for_pseudo.iter().filter(|m| m.pseudo == Some(pe)).copied().collect();
+                    let ua_n = for_pseudo[..ua_count - own_ua].iter().filter(|m| m.pseudo == Some(pe)).count();
+                    let ps = cascade(&s, &list, ua_n, &[], &[], root_font_size, width, |decls| {
+                        // Never stored: nothing inherits from a pseudo-element's
+                        // custom properties.
+                        custom.apply(usize::MAX, Some(id), decls)
+                    });
+                    if ps.content.is_some() && ps.display != Display::None {
+                        generated.push((id, pe, ps));
+                    }
                 }
                 s
             }
@@ -456,7 +569,12 @@ pub(crate) fn compute(dom: &Dom, ua: &Stylesheet, author: &[AuthorSheet<'_>], wi
         };
         styles.push(style);
     }
-    styles
+    let mut pseudo: BTreeMap<NodeId, [Option<usize>; 2]> = BTreeMap::new();
+    for (node, pe, st) in generated {
+        pseudo.entry(node).or_default()[pe as usize] = Some(styles.len());
+        styles.push(st);
+    }
+    Styles { all: styles, pseudo }
 }
 
 fn ancestor_chain(dom: &Dom, id: NodeId) -> Vec<&Element> {
@@ -538,14 +656,40 @@ fn cascade<'a>(
             Length::FitContent => Len::FitContent,
         }
     };
-    let mut underline = false;
-    let mut line_through = false;
-    let mut borders = BorderSpec { width: [3.0; 4], styled: [false; 4], color: [ColorValue::Current; 4] };
+    // Computed lengths that stay `Length`s (backgrounds, gradients): only
+    // px, percentages and their sums are left.
+    let computed = |l: Length| -> Length {
+        match len(l) {
+            Len::Px(v) => Length::Px(v),
+            Len::Pct(p) => Length::Pct(p),
+            Len::Calc(px, pct) => Length::Calc(Calc { px, pct, ..Calc::default() }),
+            _ => Length::Auto,
+        }
+    };
+    let mut spec = Specified {
+        underline: false,
+        line_through: false,
+        borders: BorderSpec { width: [3.0; 4], styled: [false; 4], color: [ColorValue::Current; 4] },
+        bg: BgSpec::default(),
+    };
     for d in decls.iter().map(|d| &**d) {
         match *d {
             // Already handled by `substitute`.
             Decl::Custom(_) | Decl::Var(_) => {}
             Decl::Display(v) => s.display = v,
+            Decl::BgImage(ref l) => spec.bg.image = Some(l.clone()),
+            Decl::BgRepeat(ref l) => spec.bg.repeat = Some(l.clone()),
+            Decl::BgPosition(ref l) => spec.bg.position = Some(l.clone()),
+            Decl::BgSize(ref l) => spec.bg.size = Some(l.clone()),
+            Decl::BgOrigin(ref l) => spec.bg.origin = Some(l.clone()),
+            Decl::BgClip(ref l) => spec.bg.clip = Some(l.clone()),
+            Decl::BgFixed(ref l) => spec.bg.fixed = Some(l.clone()),
+            Decl::Content(ref c) => s.content = c.clone(),
+            Decl::Counters(op, ref l) => s.counters[op as usize] = (!l.is_empty()).then(|| l.clone()),
+            Decl::Quotes(ref q) => s.quotes = q.clone(),
+            Decl::BorderCollapse(v) => s.border_collapse = v,
+            Decl::TableFixed(v) => s.table_fixed = v,
+            Decl::CaptionBottom(v) => s.caption_bottom = v,
             Decl::Color(c) => s.color = resolve_color(c, parent.color),
             Decl::Background(c) => {
                 let c = resolve_color(c, s.color);
@@ -579,8 +723,8 @@ fn cascade<'a>(
             Decl::FontFamily(f) => s.family = f,
             Decl::TextAlign(a) => s.text_align = a,
             Decl::Decoration { underline: u, line_through: l } => {
-                underline = u;
-                line_through = l;
+                spec.underline = u;
+                spec.line_through = l;
             }
             Decl::LineHeight(lh) => {
                 s.line_height = match lh {
@@ -600,7 +744,7 @@ fn cascade<'a>(
             Decl::MaxWidth(l) => s.max_width = l.map(len),
             Decl::VerticalAlign(v) => s.vertical_align = v,
             Decl::BorderBox(v) => s.border_box = v,
-            Decl::BorderSpacing(l) => s.border_spacing = len(l).resolve(0.0).clamp(0.0, 1000.0),
+            Decl::BorderSpacing(h, v) => s.border_spacing = [h, v].map(|l| len(l).resolve(0.0).clamp(0.0, 1000.0)),
             Decl::Position(p) => s.position = p,
             Decl::Inset(i, l) => s.inset[i & 3] = len(l),
             Decl::ZIndex(z) => s.z_index = z,
@@ -611,9 +755,9 @@ fn cascade<'a>(
             Decl::MinHeight(l) => s.min_height = len(l),
             Decl::MaxHeight(l) => s.max_height = l.map(len),
             Decl::MinWidth(l) => s.min_width = len(l),
-            Decl::BorderWidth(i, l) => borders.width[i & 3] = len(l).resolve(0.0).clamp(0.0, 1000.0),
-            Decl::BorderStyle(i, v) => borders.styled[i & 3] = v,
-            Decl::BorderColor(i, c) => borders.color[i & 3] = c,
+            Decl::BorderWidth(i, l) => spec.borders.width[i & 3] = len(l).resolve(0.0).clamp(0.0, 1000.0),
+            Decl::BorderStyle(i, v) => spec.borders.styled[i & 3] = v,
+            Decl::BorderColor(i, c) => spec.borders.color[i & 3] = c,
             Decl::BorderRadius(l) => s.radius = len(l),
             Decl::FlexDirection(d) => s.flex_direction = d,
             Decl::FlexWrap(w) => s.flex_wrap = w,
@@ -627,17 +771,21 @@ fn cascade<'a>(
             Decl::Order(o) => s.order = o,
             Decl::Gap(axis, l) => s.gap[axis & 1] = len(l),
             Decl::Masked(m) => s.masked = m,
-            Decl::Wide(p, w) => apply_wide(&mut s, parent, p, w, &mut underline, &mut line_through, &mut borders),
+            Decl::Wide(p, w) => apply_wide(&mut s, parent, p, w, &mut spec),
         }
     }
-    s.underline = parent.underline || underline;
-    s.line_through = parent.line_through || line_through;
+    s.underline = parent.underline || spec.underline;
+    s.line_through = parent.line_through || spec.line_through;
+    let borders = &spec.borders;
     for i in 0..4 {
         // Browsers draw borders in whole pixels, and never thinner than one.
         let w = borders.width[i];
         s.border_width[i] = if !borders.styled[i] || w <= 0.0 { 0.0 } else { w.floor().max(1.0) };
         s.border_color[i] = resolve_color(borders.color[i], s.color);
     }
+    let (layers, color_clip) = spec.bg.layers(computed);
+    s.bg_color_clip = color_clip;
+    s.bg_layers = if spec.bg.inherit { parent.bg_layers.clone() } else { layers };
     // Floats and absolutely positioned boxes are always block-level.
     if s.out_of_flow() {
         s.float = Float::None;
@@ -648,6 +796,14 @@ fn cascade<'a>(
     s
 }
 
+/// Properties that are only computed once the whole cascade is known.
+struct Specified {
+    underline: bool,
+    line_through: bool,
+    borders: BorderSpec,
+    bg: BgSpec,
+}
+
 /// Border properties as specified; the used widths depend on the style.
 struct BorderSpec {
     width: [f32; 4],
@@ -655,37 +811,107 @@ struct BorderSpec {
     color: [ColorValue; 4],
 }
 
+/// The background longhands as specified; `None` is the initial value.
+#[derive(Default)]
+struct BgSpec {
+    image: Option<Arc<[Option<Image>]>>,
+    repeat: Option<Arc<[[Repeat; 2]]>>,
+    position: Option<Arc<[[Length; 2]]>>,
+    size: Option<Arc<[BgSize]>>,
+    origin: Option<Arc<[BoxArea]>>,
+    clip: Option<Arc<[BoxArea]>>,
+    fixed: Option<Arc<[bool]>>,
+    /// A longhand said `inherit`: take the parent's layers whole.
+    inherit: bool,
+}
+
+impl BgSpec {
+    /// The image layers (lists shorter than `background-image` repeat, as
+    /// CSS says) and the box the color is clipped to.
+    fn layers(&self, computed: impl Fn(Length) -> Length) -> (Option<Arc<[BgLayer]>>, BoxArea) {
+        fn pick<T: Copy>(list: &Option<Arc<[T]>>, i: usize, initial: T) -> T {
+            list.as_ref().filter(|l| !l.is_empty()).map_or(initial, |l| l[i % l.len()])
+        }
+        let n = self.image.as_ref().map_or(1, |l| l.len().max(1));
+        let color_clip = pick(&self.clip, n - 1, BoxArea::Border);
+        let Some(images) = &self.image else { return (None, color_clip) };
+        let layers: Vec<BgLayer> = images
+            .iter()
+            .enumerate()
+            .filter_map(|(i, image)| {
+                let image = match image.as_ref()? {
+                    Image::Url(u) => Image::Url(u.clone()),
+                    Image::Gradient(g) => Image::Gradient(Arc::new(g.map_lengths(&computed))),
+                };
+                let size = match pick(&self.size, i, BgSize::Size(Length::Auto, Length::Auto)) {
+                    BgSize::Size(w, h) => BgSize::Size(computed(w), computed(h)),
+                    s => s,
+                };
+                Some(BgLayer {
+                    image,
+                    repeat: pick(&self.repeat, i, [Repeat::Repeat; 2]),
+                    position: pick(&self.position, i, [Length::Pct(0.0); 2]).map(&computed),
+                    size,
+                    origin: pick(&self.origin, i, BoxArea::Padding),
+                    clip: pick(&self.clip, i, BoxArea::Border),
+                    fixed: pick(&self.fixed, i, false),
+                })
+            })
+            .collect();
+        ((!layers.is_empty()).then(|| layers.into()), color_clip)
+    }
+}
+
 fn calc_px(c: Calc, em: f32, root_font_size: f32, viewport: f32) -> f32 {
     c.px + c.em * em + c.rem * root_font_size + c.vw * viewport / 100.0
 }
 
-fn apply_wide(
-    s: &mut Style,
-    parent: &Style,
-    p: Prop,
-    w: Wide,
-    underline: &mut bool,
-    line_through: &mut bool,
-    borders: &mut BorderSpec,
-) {
+fn apply_wide(s: &mut Style, parent: &Style, p: Prop, w: Wide, spec: &mut Specified) {
     let inherit = match w {
         Wide::Inherit => true,
         Wide::Initial => false,
         Wide::Unset => p.inherited(),
     };
     let src = if inherit { parent.clone() } else { Style::initial() };
+    let borders = &mut spec.borders;
+    let bg = &mut spec.bg;
+    if matches!(
+        p,
+        Prop::BgImage
+            | Prop::BgRepeat
+            | Prop::BgPosition
+            | Prop::BgSize
+            | Prop::BgOrigin
+            | Prop::BgClip
+            | Prop::BgAttachment
+    ) {
+        bg.inherit = inherit;
+    }
     match p {
         Prop::Display => s.display = src.display,
         Prop::Color => s.color = src.color,
         Prop::Background => s.background = src.background,
+        Prop::BgImage => bg.image = None,
+        Prop::BgRepeat => bg.repeat = None,
+        Prop::BgPosition => bg.position = None,
+        Prop::BgSize => bg.size = None,
+        Prop::BgOrigin => bg.origin = None,
+        Prop::BgClip => bg.clip = None,
+        Prop::BgAttachment => bg.fixed = None,
+        Prop::Content => s.content = src.content,
+        Prop::Counters(op) => s.counters[op as usize] = src.counters[op as usize].clone(),
+        Prop::Quotes => s.quotes = src.quotes,
+        Prop::BorderCollapse => s.border_collapse = src.border_collapse,
+        Prop::TableLayout => s.table_fixed = src.table_fixed,
+        Prop::CaptionSide => s.caption_bottom = src.caption_bottom,
         Prop::FontSize => {}
         Prop::FontWeight => s.weight = src.weight,
         Prop::FontStyle => s.italic = src.italic,
         Prop::FontFamily => s.family = src.family,
         Prop::TextAlign => s.text_align = src.text_align,
         Prop::TextDecoration => {
-            *underline = false;
-            *line_through = false;
+            spec.underline = false;
+            spec.line_through = false;
         }
         Prop::LineHeight => s.line_height = src.line_height,
         Prop::WhiteSpace => s.white_space = src.white_space,
@@ -758,12 +984,17 @@ fn font_size(fs: FontSize, parent: f32, root: f32, viewport: f32) -> f32 {
 /// Legacy presentational attributes (`bgcolor`, `width`, `align`, `<font>`,
 /// ...). Still common on old and minimalist sites; they sit just below
 /// author CSS in the cascade.
-fn presentational_hints(el: &Element, chain: &[&Element]) -> Vec<Decl> {
+fn presentational_hints(el: &Element, chain: &[&Element], base: Base<'_>) -> Vec<Decl> {
     let mut out = Vec::new();
     let name = el.name.as_str();
     let color = |v: &str| css::parse_color(&v.trim().to_ascii_lowercase()).or_else(|| legacy_color(v));
     if let Some(c) = el.attr("bgcolor").and_then(color) {
         out.push(Decl::Background(c));
+    }
+    if matches!(name, "body" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th")
+        && let Some(url) = el.attr("background").and_then(|v| css::resolve_url(v, base))
+    {
+        out.push(Decl::BgImage(Arc::from([Some(Image::Url(url))])));
     }
     if name == "body"
         && let Some(c) = el.attr("text").and_then(color)
@@ -806,7 +1037,7 @@ fn presentational_hints(el: &Element, chain: &[&Element]) -> Vec<Decl> {
             "top" => Some(VAlign::Top),
             "middle" | "center" => Some(VAlign::Middle),
             "bottom" => Some(VAlign::Bottom),
-            "baseline" => Some(VAlign::Top),
+            "baseline" => Some(VAlign::Baseline),
             _ => None,
         };
         out.extend(va.map(Decl::VerticalAlign));
@@ -814,7 +1045,8 @@ fn presentational_hints(el: &Element, chain: &[&Element]) -> Vec<Decl> {
     if name == "table"
         && let Some(sp) = el.attr("cellspacing").and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite())
     {
-        out.push(Decl::BorderSpacing(Length::Px(sp.clamp(0.0, 1000.0))));
+        let sp = Length::Px(sp.clamp(0.0, 1000.0));
+        out.push(Decl::BorderSpacing(sp, sp));
     }
     if matches!(name, "td" | "th")
         && let Some(table) = chain.iter().skip(1).find(|e| e.name == "table")
@@ -910,7 +1142,7 @@ mod tests {
             .collect();
         let author: Vec<AuthorSheet<'_>> = sheets.iter().map(|sheet| AuthorSheet { sheet, media: None }).collect();
         let styles = compute(&parsed.dom, &ua_sheet(), &author, 1024.0);
-        (parsed.dom, styles)
+        (parsed.dom, styles.all)
     }
 
     fn style_of<'a>(dom: &Dom, styles: &'a [Style], id: &str) -> &'a Style {
