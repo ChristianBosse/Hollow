@@ -129,7 +129,7 @@ Everything below is CPU-only and deterministic, so every machine produces **iden
 bytes ─► html5ever ─► DOM ─► CSS (Stylo or own) ─► layout ─► text shaping ─► raster ─► pixels
                               │                     │          │              │
                               │                     │          rustybuzz      tiny-skia
-                              │                     taffy (flex/grid) + block/inline layout
+                              │                     own block/inline/table/flex layout
                               all stylesheets fetched regardless of media queries
 ```
 
@@ -137,7 +137,7 @@ bytes ─► html5ever ─► DOM ─► CSS (Stylo or own) ─► layout ─►
 |---|---|---|
 | HTML parsing | `html5ever` | Spec-compliant, from Servo |
 | CSS | `stylo` (from Servo/Firefox) or our own | Stylo gives Firefox-like behavior, which helps Tor Browser mimicry |
-| Layout | `taffy` + our own block/inline layout | |
+| Layout | Our own (block, inline, tables, flexbox, floats, positioning) | Fortress v0 uses its own CSS and layout in `hollow-engine`; grid is still to come |
 | Fonts | `skrifa` / `read-fonts` (fontations) | Memory-safe font parsing. Bundled fonts only; web fonts come later behind the Rust parser |
 | Text shaping | `rustybuzz` | Rust port of HarfBuzz |
 | Raster | `tiny-skia` | Software rasterizer |

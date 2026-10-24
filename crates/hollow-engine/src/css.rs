@@ -6,11 +6,13 @@
 //! whose selector list contains an unsupported selector are dropped whole,
 //! as CSS requires, rather than being matched approximately.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
-use crate::dom::Element;
+use crate::dom::{Dom, Element, NodeData, NodeId};
 use crate::style::{Display, ListStyle, TextAlign, TextTransform, VAlign, WhiteSpace};
 use crate::text::Family;
+use crate::vars;
 
 /// Hostile-input budgets for one stylesheet.
 pub(crate) const MAX_CSS_BYTES: usize = 2 << 20;
@@ -56,6 +58,107 @@ pub(crate) enum Length {
     Rem(f32),
     Pct(f32),
     Auto,
+    /// `calc()` and viewport units.
+    Calc(Calc),
+    /// `clamp(min, value, max)`; `min(a, b)` and `max(a, b)` are clamps with
+    /// one infinite bound. Never with percentages, so it always computes to px.
+    Clamp(Calc, Calc, Calc),
+    MinContent,
+    MaxContent,
+    FitContent,
+}
+
+/// A linear `calc()` sum. All but the percentage resolve when styles are
+/// computed; the percentage waits for the containing block.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub(crate) struct Calc {
+    pub px: f32,
+    pub em: f32,
+    pub rem: f32,
+    /// Percent of the viewport width.
+    pub vw: f32,
+    pub pct: f32,
+}
+
+impl Calc {
+    fn scaled(self, k: f32) -> Calc {
+        Calc { px: self.px * k, em: self.em * k, rem: self.rem * k, vw: self.vw * k, pct: self.pct * k }
+    }
+    fn plus(self, o: Calc) -> Calc {
+        Calc {
+            px: self.px + o.px,
+            em: self.em + o.em,
+            rem: self.rem + o.rem,
+            vw: self.vw + o.vw,
+            pct: self.pct + o.pct,
+        }
+    }
+    fn of(l: Length) -> Option<Calc> {
+        Some(match l {
+            Length::Px(v) => Calc { px: v, ..Calc::default() },
+            Length::Em(v) => Calc { em: v, ..Calc::default() },
+            Length::Rem(v) => Calc { rem: v, ..Calc::default() },
+            Length::Pct(v) => Calc { pct: v, ..Calc::default() },
+            Length::Calc(c) => c,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Position {
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
+    Sticky,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Float {
+    None,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Clear {
+    None,
+    Left,
+    Right,
+    Both,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FlexDirection {
+    Row,
+    RowReverse,
+    Column,
+    ColumnReverse,
+}
+
+/// `justify-content` and `align-content`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Justify {
+    Start,
+    End,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+    Stretch,
+}
+
+/// `align-items` and `align-self`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Align {
+    /// Only for `align-self`: use the container's `align-items`.
+    Auto,
+    Stretch,
+    Start,
+    End,
+    Center,
+    Baseline,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -104,6 +207,32 @@ pub(crate) enum Prop {
     VerticalAlign,
     BoxSizing,
     BorderSpacing,
+    Position,
+    Inset(usize),
+    ZIndex,
+    Float,
+    Clear,
+    Overflow(usize),
+    Height,
+    MinHeight,
+    MaxHeight,
+    MinWidth,
+    BorderWidth(usize),
+    BorderStyle(usize),
+    BorderColor(usize),
+    BorderRadius,
+    FlexDirection,
+    FlexWrap,
+    JustifyContent,
+    AlignItems,
+    AlignSelf,
+    AlignContent,
+    FlexGrow,
+    FlexShrink,
+    FlexBasis,
+    Order,
+    Gap(usize),
+    Mask,
 }
 
 impl Prop {
@@ -136,6 +265,10 @@ pub(crate) enum Wide {
 /// One parsed longhand declaration. Shorthands expand into several.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) enum Decl {
+    /// `--name: value`, cascaded and inherited by `vars`.
+    Custom(Box<RawDecl>),
+    /// A property whose value uses `var()`; parsed once `vars` substitutes it.
+    Var(Box<RawDecl>),
     Display(Display),
     Color(ColorValue),
     Background(ColorValue),
@@ -163,6 +296,39 @@ pub(crate) enum Decl {
     VerticalAlign(VAlign),
     BorderBox(bool),
     BorderSpacing(Length),
+    Position(Position),
+    /// Side order as for margins: top, right, bottom, left.
+    Inset(usize, Length),
+    /// `None` means `auto`.
+    ZIndex(Option<i32>),
+    Float(Float),
+    Clear(Clear),
+    /// Axis 0 is x, 1 is y; `true` for anything but `visible`.
+    Overflow(usize, bool),
+    Height(Length),
+    MinHeight(Length),
+    MaxHeight(Option<Length>),
+    MinWidth(Length),
+    BorderWidth(usize, Length),
+    /// `false` for `none` and `hidden`.
+    BorderStyle(usize, bool),
+    BorderColor(usize, ColorValue),
+    BorderRadius(Length),
+    FlexDirection(FlexDirection),
+    FlexWrap(bool),
+    JustifyContent(Justify),
+    AlignItems(Align),
+    AlignSelf(Align),
+    AlignContent(Justify),
+    FlexGrow(f32),
+    FlexShrink(f32),
+    /// `Length::Auto` means `auto` (and `content`).
+    FlexBasis(Length),
+    Order(i32),
+    /// Axis 0 is the row gap, 1 the column gap.
+    Gap(usize, Length),
+    /// Any `mask`/`mask-image` other than `none`.
+    Masked(bool),
     Wide(Prop, Wide),
 }
 
@@ -172,13 +338,50 @@ pub(crate) struct Declaration {
     pub important: bool,
 }
 
+/// A declaration kept as text until computed-value time: a custom property,
+/// or a property whose value uses `var()`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct RawDecl {
+    /// Custom property names keep their case; other names are lowercase.
+    pub name: Arc<str>,
+    pub value: Arc<str>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Combinator {
     Descendant,
     Child,
+    /// `a + b`.
+    Next,
+    /// `a ~ b`.
+    Later,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AttrOp {
+    Exists,
+    Equals,
+    /// `~=`: one of the whitespace-separated words.
+    Includes,
+    /// `|=`: equal, or followed by `-`.
+    Dash,
+    Prefix,
+    Suffix,
+    Substring,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct AttrSel {
+    /// Lowercase: HTML attribute names are case-insensitive.
+    name: String,
+    op: AttrOp,
+    /// Already lowercase when `ci`.
+    value: String,
+    /// ASCII case-insensitive value comparison.
+    ci: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum Pseudo {
     /// `:link` / `:any-link`. `:visited` never matches: history must not
     /// influence rendering.
@@ -186,6 +389,25 @@ enum Pseudo {
     Root,
     /// Dynamic states (`:hover`, `:focus`, ...) that a static render never has.
     Never,
+    /// `:checked`, from the `checked` / `selected` attributes: nothing can
+    /// toggle them in a static render.
+    Checked,
+    /// `:nth-child(an+b)` and the other structural pseudo-classes
+    /// (`:first-child` is `a = 0, b = 1`).
+    Nth {
+        a: i32,
+        b: i32,
+        of_type: bool,
+        from_end: bool,
+    },
+    Empty,
+    Not(Vec<Selector>),
+    /// `:is()` and `:where()`, which only differ in specificity.
+    Is(Vec<Selector>),
+    /// Lowercase language ranges.
+    Lang(Vec<String>),
+    /// `:dir(rtl)` when true, `:dir(ltr)` when false.
+    Dir(bool),
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
@@ -193,6 +415,7 @@ struct Compound {
     tag: Option<String>,
     id: Option<String>,
     classes: Vec<String>,
+    attrs: Vec<AttrSel>,
     pseudo: Vec<Pseudo>,
 }
 
@@ -321,11 +544,18 @@ impl Stylesheet {
         self.rules.push(Rule { selectors, decls, media: media.to_vec() });
     }
 
-    /// Every rule matching `chain[0]`, whose ancestors are `chain[1..]`
-    /// (nearest first), for a viewport `width` CSS px wide. `order_base` is
-    /// added to rule indices so several sheets can share one cascade order.
-    pub fn matching<'a>(&'a self, chain: &[&Element], width: f32, order_base: u32, out: &mut Vec<Matched<'a>>) {
-        let Some(el) = chain.first() else { return };
+    /// Every rule matching element `node`, for a viewport `width` CSS px
+    /// wide. `order_base` is added to rule indices so several sheets can
+    /// share one cascade order.
+    pub fn matching<'a>(
+        &'a self,
+        tree: &Tree<'_>,
+        node: NodeId,
+        width: f32,
+        order_base: u32,
+        out: &mut Vec<Matched<'a>>,
+    ) {
+        let Some(el) = tree.dom.element(node) else { return };
         let mut candidates: Vec<(u32, u32)> = self.universal.clone();
         if let Some(v) = el.id.as_ref().and_then(|id| self.by_id.get(id)) {
             candidates.extend_from_slice(v);
@@ -345,7 +575,7 @@ impl Stylesheet {
         for (rule, sel) in candidates {
             let r = &self.rules[rule as usize];
             let s = &r.selectors[sel as usize];
-            if r.media.iter().all(|m| m.matches(width)) && s.matches(chain) {
+            if r.media.iter().all(|m| m.matches(width)) && s.matches(tree, node) {
                 out.push(Matched {
                     specificity: s.specificity,
                     order: order_base.saturating_add(rule),
@@ -356,40 +586,136 @@ impl Stylesheet {
     }
 }
 
-impl Selector {
-    fn matches(&self, chain: &[&Element]) -> bool {
-        let n = self.compounds.len();
-        if chain.is_empty() || !compound_matches(&self.compounds[n - 1], chain, 0) {
-            return false;
-        }
-        // Dynamic programming over (compound, ancestor) instead of recursive
-        // backtracking: O(compounds * depth) even for adversarial selectors.
-        let mut reachable = vec![false; chain.len()];
-        reachable[0] = true;
-        for i in (0..n - 1).rev() {
-            let mut next = vec![false; chain.len()];
-            let mut any = false;
-            match self.combinators[i] {
-                Combinator::Child => {
-                    for p in 0..chain.len() - 1 {
-                        if reachable[p] && compound_matches(&self.compounds[i], chain, p + 1) {
-                            next[p + 1] = true;
-                            any = true;
-                        }
-                    }
-                }
-                Combinator::Descendant => {
-                    let mut seen = false;
-                    for p in 0..chain.len() {
-                        if seen && compound_matches(&self.compounds[i], chain, p) {
-                            next[p] = true;
-                            any = true;
-                        }
-                        seen |= reachable[p];
-                    }
+/// Matching one selector looks at no more elements than this, `:is()` and
+/// `:not()` arguments included; a selector that would need more does not
+/// match. Real selectors stay far below it.
+const MAX_MATCH_STEPS: u32 = 10_000;
+/// `a ~ b` looks back at most this many siblings from each candidate.
+const MAX_SIBLING_SCAN: usize = 512;
+
+/// The DOM as selector matching sees it: the elements plus what structural,
+/// `:lang()` and `:dir()` selectors need, computed once per document rather
+/// than on every match.
+pub(crate) struct Tree<'a> {
+    pub dom: &'a Dom,
+    info: Vec<NodeInfo>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct NodeInfo {
+    /// Previous element sibling.
+    prev: Option<NodeId>,
+    /// 1-based position among the parent's element children, and their count.
+    index: u32,
+    count: u32,
+    /// The same among siblings with the same tag name.
+    type_index: u32,
+    type_count: u32,
+    /// Nearest inclusive ancestor with a `lang` attribute.
+    lang: Option<NodeId>,
+    rtl: bool,
+}
+
+impl<'a> Tree<'a> {
+    pub fn new(dom: &'a Dom) -> Tree<'a> {
+        let mut info = vec![NodeInfo::default(); dom.nodes.len()];
+        let mut types: BTreeMap<&str, u32> = BTreeMap::new();
+        // The arena is in document order, so parents are done before children.
+        for (id, node) in dom.nodes.iter().enumerate() {
+            if let Some(el) = dom.element(id) {
+                let parent = node.parent.and_then(|p| info.get(p).copied()).unwrap_or_default();
+                info[id].lang = if el.attr("lang").is_some() { Some(id) } else { parent.lang };
+                info[id].rtl = match el.attr("dir").map(str::trim) {
+                    Some(d) if d.eq_ignore_ascii_case("rtl") => true,
+                    Some(d) if d.eq_ignore_ascii_case("ltr") => false,
+                    _ => parent.rtl,
+                };
+            }
+            types.clear();
+            let mut prev = None;
+            let mut count = 0;
+            for &c in &node.children {
+                let Some(el) = dom.element(c) else { continue };
+                count += 1;
+                let of_type = types.entry(el.name.as_str()).or_default();
+                *of_type += 1;
+                info[c].prev = prev;
+                info[c].index = count;
+                info[c].type_index = *of_type;
+                prev = Some(c);
+            }
+            for &c in &node.children {
+                if let Some(el) = dom.element(c) {
+                    info[c].count = count;
+                    info[c].type_count = types.get(el.name.as_str()).copied().unwrap_or(0);
                 }
             }
-            if !any {
+        }
+        Tree { dom, info }
+    }
+
+    fn parent(&self, n: NodeId) -> Option<NodeId> {
+        self.dom.nodes.get(n)?.parent.filter(|&p| self.dom.element(p).is_some())
+    }
+
+    fn prev(&self, n: NodeId) -> Option<NodeId> {
+        self.info.get(n)?.prev
+    }
+}
+
+impl Selector {
+    fn matches(&self, tree: &Tree<'_>, node: NodeId) -> bool {
+        let mut budget = MAX_MATCH_STEPS;
+        // Running out part-way could make a `:not()` succeed, so an exhausted
+        // budget is a miss whatever the partial result.
+        self.matches_within(tree, node, &mut budget) && budget > 0
+    }
+
+    fn matches_within(&self, tree: &Tree<'_>, node: NodeId, budget: &mut u32) -> bool {
+        let n = self.compounds.len();
+        if !compound_matches(&self.compounds[n - 1], tree, node, budget) {
+            return false;
+        }
+        // Right to left, keeping the set of elements the compounds so far can
+        // stand for instead of backtracking: each step visits an element at
+        // most once, so adversarial selectors stay linear.
+        let mut reachable = vec![node];
+        let mut seen = BTreeSet::new();
+        for i in (0..n - 1).rev() {
+            let compound = &self.compounds[i];
+            let comb = self.combinators[i];
+            let up = matches!(comb, Combinator::Child | Combinator::Descendant);
+            let walk = matches!(comb, Combinator::Descendant | Combinator::Later);
+            let step = |e: NodeId| if up { tree.parent(e) } else { tree.prev(e) };
+            // Walks from a single start never revisit an element.
+            let dedup = reachable.len() > 1;
+            seen.clear();
+            let mut next = Vec::new();
+            for &start in &reachable {
+                let mut cur = step(start);
+                let mut scanned = 0;
+                while let Some(e) = cur {
+                    // Everything past an element seen before was walked from it.
+                    if dedup && !seen.insert(e) {
+                        break;
+                    }
+                    if compound_matches(compound, tree, e, budget) {
+                        if i == 0 {
+                            return true;
+                        }
+                        next.push(e);
+                    }
+                    if *budget == 0 {
+                        return false;
+                    }
+                    scanned += 1;
+                    if !walk || (!up && scanned >= MAX_SIBLING_SCAN) {
+                        break;
+                    }
+                    cur = step(e);
+                }
+            }
+            if next.is_empty() {
                 return false;
             }
             reachable = next;
@@ -398,8 +724,12 @@ impl Selector {
     }
 }
 
-fn compound_matches(c: &Compound, chain: &[&Element], pos: usize) -> bool {
-    let el = chain[pos];
+fn compound_matches(c: &Compound, tree: &Tree<'_>, node: NodeId, budget: &mut u32) -> bool {
+    let Some(el) = tree.dom.element(node) else { return false };
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
     if c.tag.as_ref().is_some_and(|t| *t != el.name) {
         return false;
     }
@@ -409,11 +739,141 @@ fn compound_matches(c: &Compound, chain: &[&Element], pos: usize) -> bool {
     if !c.classes.iter().all(|cl| el.classes.contains(cl)) {
         return false;
     }
+    if !c.attrs.iter().all(|a| a.matches(el)) {
+        return false;
+    }
+    let info = tree.info.get(node).copied().unwrap_or_default();
     c.pseudo.iter().all(|p| match p {
         Pseudo::Link => el.has_href && (el.name == "a" || el.name == "area"),
-        Pseudo::Root => pos == chain.len() - 1 && el.name == "html",
+        Pseudo::Root => el.name == "html" && tree.parent(node).is_none(),
         Pseudo::Never => false,
+        Pseudo::Checked => match el.name.as_str() {
+            "input" => {
+                el.attr("checked").is_some()
+                    && el
+                        .attr("type")
+                        .map(str::trim)
+                        .is_some_and(|t| t.eq_ignore_ascii_case("checkbox") || t.eq_ignore_ascii_case("radio"))
+            }
+            "option" => el.attr("selected").is_some(),
+            _ => false,
+        },
+        &Pseudo::Nth { a, b, of_type, from_end } => {
+            let (index, count) = if of_type { (info.type_index, info.type_count) } else { (info.index, info.count) };
+            let k = if from_end { i64::from(count) - i64::from(index) + 1 } else { i64::from(index) };
+            nth_matches(a, b, k)
+        }
+        Pseudo::Empty => tree.dom.nodes[node]
+            .children
+            .iter()
+            .all(|&ch| matches!(&tree.dom.nodes[ch].data, NodeData::Text(t) if t.is_empty())),
+        Pseudo::Not(list) => !list.iter().any(|s| s.matches_within(tree, node, budget)),
+        Pseudo::Is(list) => list.iter().any(|s| s.matches_within(tree, node, budget)),
+        Pseudo::Lang(ranges) => {
+            let lang = info.lang.and_then(|l| tree.dom.element(l)).and_then(|e| e.attr("lang")).unwrap_or("").trim();
+            !lang.is_empty() && ranges.iter().any(|r| lang_matches(lang, r))
+        }
+        &Pseudo::Dir(rtl) => info.rtl == rtl,
     })
+}
+
+/// Whether the 1-based position `k` is `a*n + b` for some `n >= 0`.
+fn nth_matches(a: i32, b: i32, k: i64) -> bool {
+    let (a, b) = (i64::from(a), i64::from(b));
+    if a == 0 {
+        return k == b;
+    }
+    let d = k - b;
+    d % a == 0 && d / a >= 0
+}
+
+/// `:lang()` matching: `en` matches `en` and `en-GB`, case-insensitively;
+/// `*` matches any language.
+fn lang_matches(lang: &str, range: &str) -> bool {
+    if range == "*" {
+        return true;
+    }
+    let (l, r) = (lang.as_bytes(), range.as_bytes());
+    l.get(..r.len()).is_some_and(|p| p.eq_ignore_ascii_case(r)) && (l.len() == r.len() || l[r.len()] == b'-')
+}
+
+/// Attributes whose values HTML compares ASCII case-insensitively in
+/// selectors (unless the `s` flag says otherwise). Sorted.
+const CI_ATTRS: &[&str] = &[
+    "accept",
+    "accept-charset",
+    "align",
+    "alink",
+    "axis",
+    "bgcolor",
+    "charset",
+    "checked",
+    "clear",
+    "codetype",
+    "color",
+    "compact",
+    "declare",
+    "defer",
+    "dir",
+    "direction",
+    "disabled",
+    "enctype",
+    "face",
+    "frame",
+    "hreflang",
+    "http-equiv",
+    "lang",
+    "language",
+    "link",
+    "media",
+    "method",
+    "multiple",
+    "nohref",
+    "noresize",
+    "noshade",
+    "nowrap",
+    "readonly",
+    "rel",
+    "rev",
+    "rules",
+    "scope",
+    "scrolling",
+    "selected",
+    "shape",
+    "target",
+    "text",
+    "type",
+    "valign",
+    "valuetype",
+    "vlink",
+];
+
+impl AttrSel {
+    fn matches(&self, el: &Element) -> bool {
+        let Some(value) = el.attr(&self.name) else { return false };
+        let (v, want) = (value.as_bytes(), self.value.as_bytes());
+        let eq = |a: &[u8]| if self.ci { a.eq_ignore_ascii_case(want) } else { a == want };
+        match self.op {
+            AttrOp::Exists => true,
+            AttrOp::Equals => eq(v),
+            AttrOp::Includes => {
+                !want.is_empty()
+                    && !want.iter().any(u8::is_ascii_whitespace)
+                    && v.split(u8::is_ascii_whitespace).any(eq)
+            }
+            AttrOp::Dash => v.get(..want.len()).is_some_and(eq) && (v.len() == want.len() || v[want.len()] == b'-'),
+            AttrOp::Prefix => !want.is_empty() && v.get(..want.len()).is_some_and(eq),
+            AttrOp::Suffix => !want.is_empty() && v.len() >= want.len() && eq(&v[v.len() - want.len()..]),
+            AttrOp::Substring => {
+                !want.is_empty()
+                    && if self.ci {
+                        value.to_ascii_lowercase().contains(self.value.as_str())
+                    } else {
+                        value.contains(self.value.as_str())
+                    }
+            }
+        }
+    }
 }
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
@@ -667,6 +1127,32 @@ fn skip_block(b: &[u8], open: usize) -> (usize, usize) {
 }
 
 /// Splits on `sep` at nesting depth zero (parens, brackets, braces, strings).
+/// Whitespace-separated words, keeping `calc(1px + 2px)` and the like whole.
+fn words(s: &str) -> Vec<&str> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = None;
+    for (i, &c) in b.iter().enumerate() {
+        match c {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if c.is_ascii_whitespace() && depth == 0 {
+            if let Some(st) = start.take() {
+                out.push(&s[st..i]);
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(st) = start {
+        out.push(&s[st..]);
+    }
+    out
+}
+
 fn split_top_level(s: &str, sep: u8) -> Vec<&str> {
     let b = s.as_bytes();
     let mut parts = Vec::new();
@@ -705,21 +1191,42 @@ fn split_top_level(s: &str, sep: u8) -> Vec<&str> {
 // ---------------------------------------------------------------------------
 // Selectors
 
+/// `:is()` / `:not()` / `:where()` nested deeper than this make a selector
+/// invalid.
+const MAX_SELECTOR_NESTING: usize = 8;
+
 pub(crate) fn parse_selector_list(s: &str) -> Option<Vec<Selector>> {
+    parse_list(s, 0)
+}
+
+/// `depth` is the `:is()`/`:not()` nesting the list sits in.
+fn parse_list(s: &str, depth: usize) -> Option<Vec<Selector>> {
     let parts = split_top_level(s, b',');
     if parts.len() > MAX_SELECTORS_PER_RULE {
         return None;
     }
-    parts.into_iter().map(parse_selector).collect()
+    parts.into_iter().map(|p| parse_selector(p, depth)).collect()
 }
 
-fn parse_selector(s: &str) -> Option<Selector> {
+/// The forgiving list of `:is()` and `:where()`: entries we can't parse are
+/// dropped instead of invalidating the whole selector.
+fn parse_forgiving_list(s: &str, depth: usize) -> Option<Vec<Selector>> {
+    let parts = split_top_level(s, b',');
+    if parts.len() > MAX_SELECTORS_PER_RULE {
+        return None;
+    }
+    Some(parts.into_iter().filter_map(|p| parse_selector(p, depth)).collect())
+}
+
+fn parse_selector(s: &str, depth: usize) -> Option<Selector> {
     let chars: Vec<char> = s.trim().chars().collect();
     let mut compounds: Vec<Compound> = Vec::new();
     let mut combinators = Vec::new();
     let mut cur = Compound::default();
     let mut cur_has = false;
     let mut pending: Option<Combinator> = None;
+    // Ids; classes, attributes and pseudo-classes; types.
+    let mut spec = [0u32; 3];
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -732,15 +1239,24 @@ fn parse_selector(s: &str) -> Option<Selector> {
             i += 1;
             continue;
         }
-        if c == '>' {
+        let explicit = match c {
+            '>' => Some(Combinator::Child),
+            '+' => Some(Combinator::Next),
+            '~' => Some(Combinator::Later),
+            _ => None,
+        };
+        if let Some(comb) = explicit {
             if cur_has {
                 compounds.push(std::mem::take(&mut cur));
                 cur_has = false;
+            } else if pending.is_some_and(|p| p != Combinator::Descendant) {
+                // `a > > b`.
+                return None;
             }
             if compounds.is_empty() {
                 return None;
             }
-            pending = Some(Combinator::Child);
+            pending = Some(comb);
             i += 1;
             continue;
         }
@@ -757,6 +1273,7 @@ fn parse_selector(s: &str) -> Option<Selector> {
             '.' => {
                 i += 1;
                 cur.classes.push(ident(&chars, &mut i)?);
+                spec[1] += 1;
             }
             '#' => {
                 i += 1;
@@ -766,30 +1283,59 @@ fn parse_selector(s: &str) -> Option<Selector> {
                     cur.pseudo.push(Pseudo::Never);
                 }
                 cur.id = Some(id);
+                spec[0] += 1;
+            }
+            '[' => {
+                i += 1;
+                cur.attrs.push(attribute(&chars, &mut i)?);
+                spec[1] += 1;
             }
             ':' => {
                 i += 1;
+                // Pseudo-elements: generated content isn't drawn (yet), so the
+                // rule is dropped rather than applied to the element itself.
                 if chars.get(i) == Some(&':') {
                     return None;
                 }
                 let name = ident(&chars, &mut i)?.to_ascii_lowercase();
                 if chars.get(i) == Some(&'(') {
-                    return None;
+                    let close = close_paren(&chars, i)?;
+                    let arg: String = chars[i + 1..close].iter().collect();
+                    i = close + 1;
+                    let (pseudo, s) = functional_pseudo(&name, &arg, depth)?;
+                    cur.pseudo.push(pseudo);
+                    for (total, s) in spec.iter_mut().zip(s) {
+                        *total = total.saturating_add(s);
+                    }
+                    cur_has = true;
+                    continue;
                 }
-                cur.pseudo.push(match name.as_str() {
-                    "link" | "any-link" => Pseudo::Link,
-                    "root" => Pseudo::Root,
+                let nth = |a, b, of_type, from_end| Pseudo::Nth { a, b, of_type, from_end };
+                match name.as_str() {
+                    "link" | "any-link" => cur.pseudo.push(Pseudo::Link),
+                    // In a stylesheet, `:scope` is the root.
+                    "root" | "scope" => cur.pseudo.push(Pseudo::Root),
+                    "checked" => cur.pseudo.push(Pseudo::Checked),
+                    "empty" => cur.pseudo.push(Pseudo::Empty),
+                    "first-child" => cur.pseudo.push(nth(0, 1, false, false)),
+                    "last-child" => cur.pseudo.push(nth(0, 1, false, true)),
+                    "only-child" => cur.pseudo.extend([nth(0, 1, false, false), nth(0, 1, false, true)]),
+                    "first-of-type" => cur.pseudo.push(nth(0, 1, true, false)),
+                    "last-of-type" => cur.pseudo.push(nth(0, 1, true, true)),
+                    "only-of-type" => cur.pseudo.extend([nth(0, 1, true, false), nth(0, 1, true, true)]),
                     "visited" | "hover" | "active" | "focus" | "focus-visible" | "focus-within" | "target"
-                    | "checked" | "disabled" | "enabled" | "indeterminate" | "default" | "autofill"
-                    | "placeholder-shown" | "popover-open" | "modal" | "fullscreen" | "open" => Pseudo::Never,
+                    | "disabled" | "enabled" | "indeterminate" | "default" | "autofill" | "placeholder-shown"
+                    | "popover-open" | "modal" | "fullscreen" | "open" => cur.pseudo.push(Pseudo::Never),
                     _ => return None,
-                });
+                }
+                spec[1] += 1;
             }
             c if c == '\\' || is_ident_start(c) => {
                 if cur_has {
                     return None;
                 }
                 cur.tag = Some(ident(&chars, &mut i)?.to_ascii_lowercase());
+                spec[2] += 1;
             }
             _ => return None,
         }
@@ -797,20 +1343,181 @@ fn parse_selector(s: &str) -> Option<Selector> {
     }
     if cur_has {
         compounds.push(cur);
-    } else if pending == Some(Combinator::Child) {
+    } else if pending.is_some_and(|p| p != Combinator::Descendant) {
         return None;
     }
     if compounds.is_empty() || compounds.len() > MAX_COMPOUNDS {
         return None;
     }
-    let (mut ids, mut classes, mut tags) = (0u32, 0u32, 0u32);
-    for c in &compounds {
-        ids += c.id.is_some() as u32;
-        classes += (c.classes.len() + c.pseudo.len()) as u32;
-        tags += c.tag.is_some() as u32;
-    }
-    let specificity = (ids.min(255) << 16) | (classes.min(255) << 8) | tags.min(255);
+    let specificity = (spec[0].min(255) << 16) | (spec[1].min(255) << 8) | spec[2].min(255);
     Some(Selector { compounds, combinators, specificity })
+}
+
+/// `:not()`, `:is()`, `:nth-child()`, ... with their specificity (ids,
+/// classes, types).
+fn functional_pseudo(name: &str, arg: &str, depth: usize) -> Option<(Pseudo, [u32; 3])> {
+    let class = [0, 1, 0];
+    Some(match name {
+        "not" | "is" | "where" => {
+            if depth >= MAX_SELECTOR_NESTING {
+                return None;
+            }
+            let list = if name == "not" { parse_list(arg, depth + 1)? } else { parse_forgiving_list(arg, depth + 1)? };
+            // Selectors 4: the most specific argument counts, `:where()` none.
+            let max = list.iter().map(|s| s.specificity).max().unwrap_or(0);
+            let spec = if name == "where" { [0; 3] } else { [max >> 16, (max >> 8) & 255, max & 255] };
+            (if name == "not" { Pseudo::Not(list) } else { Pseudo::Is(list) }, spec)
+        }
+        "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type" => {
+            let (a, b) = parse_nth(arg)?;
+            (Pseudo::Nth { a, b, of_type: name.ends_with("of-type"), from_end: name.starts_with("nth-last") }, class)
+        }
+        "lang" => {
+            let ranges: Option<Vec<String>> = split_top_level(arg, b',')
+                .into_iter()
+                .map(|r| {
+                    let r = r.trim().trim_matches(|c| c == '"' || c == '\'');
+                    (!r.is_empty() && !r.contains(char::is_whitespace)).then(|| r.to_ascii_lowercase())
+                })
+                .collect();
+            (Pseudo::Lang(ranges?), class)
+        }
+        "dir" => match arg.trim().to_ascii_lowercase().as_str() {
+            "ltr" => (Pseudo::Dir(false), class),
+            "rtl" => (Pseudo::Dir(true), class),
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// The `an+b` microsyntax: `odd`, `even`, `3`, `-n+2`, `2n + 1`, ... The
+/// `of S` form is not supported, so selectors using it are dropped.
+fn parse_nth(arg: &str) -> Option<(i32, i32)> {
+    let s = arg.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "odd" => return Some((2, 1)),
+        "even" => return Some((2, 0)),
+        _ => {}
+    }
+    let unsigned = |t: &str| -> Option<i32> {
+        if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        t.parse().ok()
+    };
+    let signed = |t: &str| match t.strip_prefix('-') {
+        Some(d) => unsigned(d).map(|n| -n),
+        None => unsigned(t.strip_prefix('+').unwrap_or(t)),
+    };
+    let Some(n) = s.find('n') else { return Some((0, signed(&s)?)) };
+    let a = match &s[..n] {
+        "" | "+" => 1,
+        "-" => -1,
+        t => signed(t)?,
+    };
+    let rest = s[n + 1..].trim_start();
+    if rest.is_empty() {
+        return Some((a, 0));
+    }
+    let b = match rest.strip_prefix('+') {
+        Some(d) => unsigned(d.trim_start())?,
+        None => -unsigned(rest.strip_prefix('-')?.trim_start())?,
+    };
+    Some((a, b))
+}
+
+/// `[name]` or `[name op value flag]`; `i` is just past the `[`.
+fn attribute(chars: &[char], i: &mut usize) -> Option<AttrSel> {
+    let ws = |i: &mut usize| {
+        while chars.get(*i).is_some_and(|c| c.is_whitespace()) {
+            *i += 1;
+        }
+    };
+    ws(i);
+    let name = ident(chars, i)?.to_ascii_lowercase();
+    ws(i);
+    let op = match *chars.get(*i)? {
+        ']' => {
+            *i += 1;
+            return Some(AttrSel { name, op: AttrOp::Exists, value: String::new(), ci: false });
+        }
+        '=' => {
+            *i += 1;
+            AttrOp::Equals
+        }
+        c if chars.get(*i + 1) == Some(&'=') => {
+            let op = match c {
+                '~' => AttrOp::Includes,
+                '|' => AttrOp::Dash,
+                '^' => AttrOp::Prefix,
+                '$' => AttrOp::Suffix,
+                '*' => AttrOp::Substring,
+                _ => return None,
+            };
+            *i += 2;
+            op
+        }
+        // Namespaces (`[ns|attr]`) and garbage.
+        _ => return None,
+    };
+    ws(i);
+    let mut value = match *chars.get(*i)? {
+        q @ ('"' | '\'') => {
+            *i += 1;
+            string(chars, i, q)?
+        }
+        _ => ident(chars, i)?,
+    };
+    ws(i);
+    let mut ci = CI_ATTRS.binary_search(&name.as_str()).is_ok();
+    if chars.get(*i) != Some(&']') {
+        match ident(chars, i)?.to_ascii_lowercase().as_str() {
+            "i" => ci = true,
+            "s" => ci = false,
+            _ => return None,
+        }
+        ws(i);
+    }
+    if chars.get(*i) != Some(&']') {
+        return None;
+    }
+    *i += 1;
+    if ci {
+        value.make_ascii_lowercase();
+    }
+    Some(AttrSel { name, op, value, ci })
+}
+
+/// Index of the `)` closing the `(` at `open`, skipping strings, escapes
+/// and nested parentheses.
+fn close_paren(chars: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < chars.len() {
+        match chars[i] {
+            q @ ('"' | '\'') => {
+                i += 1;
+                while i < chars.len() && chars[i] != q {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            '\\' => i += 1,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn is_ident_start(c: char) -> bool {
@@ -822,20 +1529,7 @@ fn ident(chars: &[char], i: &mut usize) -> Option<String> {
     while let Some(&c) = chars.get(*i) {
         if c == '\\' {
             *i += 1;
-            let mut hex = String::new();
-            while hex.len() < 6 && chars.get(*i).is_some_and(|c| c.is_ascii_hexdigit()) {
-                hex.push(chars[*i]);
-                *i += 1;
-            }
-            if hex.is_empty() {
-                out.push(*chars.get(*i)?);
-                *i += 1;
-            } else {
-                out.push(u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32).unwrap_or('\u{FFFD}'));
-                if chars.get(*i).is_some_and(|c| c.is_whitespace()) {
-                    *i += 1;
-                }
-            }
+            out.push(escape(chars, i)?);
         } else if is_ident_start(c) || c.is_ascii_digit() {
             out.push(c);
             *i += 1;
@@ -844,6 +1538,44 @@ fn ident(chars: &[char], i: &mut usize) -> Option<String> {
         }
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// Decodes an escape; `i` is just past the backslash.
+fn escape(chars: &[char], i: &mut usize) -> Option<char> {
+    let mut hex = String::new();
+    while hex.len() < 6 && chars.get(*i).is_some_and(|c| c.is_ascii_hexdigit()) {
+        hex.push(chars[*i]);
+        *i += 1;
+    }
+    if hex.is_empty() {
+        let c = *chars.get(*i)?;
+        *i += 1;
+        return Some(c);
+    }
+    if chars.get(*i).is_some_and(|c| c.is_whitespace()) {
+        *i += 1;
+    }
+    Some(u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32).unwrap_or('\u{FFFD}'))
+}
+
+/// A quoted string's contents; `i` is just past the opening quote.
+fn string(chars: &[char], i: &mut usize, quote: char) -> Option<String> {
+    let mut out = String::new();
+    loop {
+        let c = *chars.get(*i)?;
+        *i += 1;
+        match c {
+            '\\' => match chars.get(*i) {
+                // An escaped newline continues the string.
+                Some('\n') => *i += 1,
+                Some(_) => out.push(escape(chars, i)?),
+                None => {}
+            },
+            '\n' => return None,
+            c if c == quote => return Some(out),
+            c => out.push(c),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -859,7 +1591,8 @@ pub(crate) fn parse_declarations(s: &str) -> Vec<Declaration> {
 fn parse_declarations_into(body: &str, out: &mut Vec<Declaration>) {
     for part in split_top_level(body, b';').into_iter().take(MAX_DECLS_PER_BLOCK) {
         let Some(colon) = part.find(':') else { continue };
-        let name = part[..colon].trim().to_ascii_lowercase();
+        let raw_name = part[..colon].trim();
+        let name = raw_name.to_ascii_lowercase();
         let mut value = part[colon + 1..].trim();
         let mut important = false;
         if let Some(bang) = value.rfind('!')
@@ -868,13 +1601,46 @@ fn parse_declarations_into(body: &str, out: &mut Vec<Declaration>) {
             important = true;
             value = value[..bang].trim_end();
         }
-        if value.is_empty() || value.contains("var(") || value.contains('{') {
+        if let Some(custom) = raw_name.strip_prefix("--") {
+            // Custom properties keep their case and their text, even empty;
+            // `vars` gives them meaning at computed-value time.
+            let valid_name = !custom.is_empty()
+                && custom.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii());
+            if valid_name && value.len() <= vars::MAX_VALUE_BYTES && !value.contains('{') {
+                let raw = RawDecl { name: raw_name.into(), value: value.into() };
+                out.push(Declaration { decl: Decl::Custom(Box::new(raw)), important });
+            }
+            continue;
+        }
+        if value.is_empty() || value.contains('{') {
+            continue;
+        }
+        if vars::has_var(value) {
+            // Substituted and parsed per element, if it is a property we know.
+            if !parse_substituted(&name, None).is_empty() {
+                let raw = RawDecl { name: name.into(), value: value.into() };
+                out.push(Declaration { decl: Decl::Var(Box::new(raw)), important });
+            }
             continue;
         }
         let mut decls = Vec::new();
         parse_property(&name, value, &mut decls);
         out.extend(decls.into_iter().map(|decl| Declaration { decl, important }));
     }
+}
+
+/// Parses a property's value after `var()` substitution. `None` (a
+/// reference failed) or a value we can't parse leaves every longhand of the
+/// property `unset`: the declaration is invalid at computed-value time.
+pub(crate) fn parse_substituted(name: &str, value: Option<&str>) -> Vec<Decl> {
+    let mut out = Vec::new();
+    if let Some(v) = value.map(str::trim).filter(|v| !v.is_empty() && !v.contains('{')) {
+        parse_property(name, v, &mut out);
+    }
+    if out.is_empty() {
+        parse_property(name, "unset", &mut out);
+    }
+    out
 }
 
 fn wide_keyword(v: &str) -> Option<Wide> {
@@ -918,6 +1684,61 @@ fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>) {
         "vertical-align" => &[Prop::VerticalAlign],
         "box-sizing" => &[Prop::BoxSizing],
         "border-spacing" => &[Prop::BorderSpacing],
+        "position" => &[Prop::Position],
+        "top" => &[Prop::Inset(0)],
+        "right" => &[Prop::Inset(1)],
+        "bottom" => &[Prop::Inset(2)],
+        "left" => &[Prop::Inset(3)],
+        "inset" => &[Prop::Inset(0), Prop::Inset(1), Prop::Inset(2), Prop::Inset(3)],
+        "z-index" => &[Prop::ZIndex],
+        "float" => &[Prop::Float],
+        "clear" => &[Prop::Clear],
+        "overflow" => &[Prop::Overflow(0), Prop::Overflow(1)],
+        "overflow-x" => &[Prop::Overflow(0)],
+        "overflow-y" => &[Prop::Overflow(1)],
+        "height" => &[Prop::Height],
+        "min-height" => &[Prop::MinHeight],
+        "max-height" => &[Prop::MaxHeight],
+        "min-width" => &[Prop::MinWidth],
+        "border" => &BORDER_ALL,
+        "border-top" => &[Prop::BorderWidth(0), Prop::BorderStyle(0), Prop::BorderColor(0)],
+        "border-right" => &[Prop::BorderWidth(1), Prop::BorderStyle(1), Prop::BorderColor(1)],
+        "border-bottom" => &[Prop::BorderWidth(2), Prop::BorderStyle(2), Prop::BorderColor(2)],
+        "border-left" => &[Prop::BorderWidth(3), Prop::BorderStyle(3), Prop::BorderColor(3)],
+        "border-width" => &[Prop::BorderWidth(0), Prop::BorderWidth(1), Prop::BorderWidth(2), Prop::BorderWidth(3)],
+        "border-style" => &[Prop::BorderStyle(0), Prop::BorderStyle(1), Prop::BorderStyle(2), Prop::BorderStyle(3)],
+        "border-color" => &[Prop::BorderColor(0), Prop::BorderColor(1), Prop::BorderColor(2), Prop::BorderColor(3)],
+        "border-top-width" => &[Prop::BorderWidth(0)],
+        "border-right-width" => &[Prop::BorderWidth(1)],
+        "border-bottom-width" => &[Prop::BorderWidth(2)],
+        "border-left-width" => &[Prop::BorderWidth(3)],
+        "border-top-style" => &[Prop::BorderStyle(0)],
+        "border-right-style" => &[Prop::BorderStyle(1)],
+        "border-bottom-style" => &[Prop::BorderStyle(2)],
+        "border-left-style" => &[Prop::BorderStyle(3)],
+        "border-top-color" => &[Prop::BorderColor(0)],
+        "border-right-color" => &[Prop::BorderColor(1)],
+        "border-bottom-color" => &[Prop::BorderColor(2)],
+        "border-left-color" => &[Prop::BorderColor(3)],
+        "border-radius" => &[Prop::BorderRadius],
+        "flex-direction" => &[Prop::FlexDirection],
+        "flex-wrap" => &[Prop::FlexWrap],
+        "flex-flow" => &[Prop::FlexDirection, Prop::FlexWrap],
+        "justify-content" => &[Prop::JustifyContent],
+        "align-items" => &[Prop::AlignItems],
+        "align-self" => &[Prop::AlignSelf],
+        "align-content" => &[Prop::AlignContent],
+        "place-items" => &[Prop::AlignItems],
+        "place-content" => &[Prop::AlignContent, Prop::JustifyContent],
+        "flex-grow" => &[Prop::FlexGrow],
+        "flex-shrink" => &[Prop::FlexShrink],
+        "flex-basis" => &[Prop::FlexBasis],
+        "flex" => &[Prop::FlexGrow, Prop::FlexShrink, Prop::FlexBasis],
+        "order" => &[Prop::Order],
+        "gap" | "grid-gap" => &[Prop::Gap(0), Prop::Gap(1)],
+        "mask" | "mask-image" | "-webkit-mask" | "-webkit-mask-image" => &[Prop::Mask],
+        "row-gap" | "grid-row-gap" => &[Prop::Gap(0)],
+        "column-gap" | "grid-column-gap" => &[Prop::Gap(1)],
         _ => return,
     };
     if let Some(w) = wide_keyword(value) {
@@ -982,7 +1803,7 @@ fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>) {
         }
         .map(Decl::TextTransform),
         "margin" | "padding" => {
-            let vals: Option<Vec<Length>> = lower.split_whitespace().map(parse_length).collect();
+            let vals: Option<Vec<Length>> = words(&lower).into_iter().map(parse_length).collect();
             let Some(vals) = vals else { return };
             let sides = match vals.as_slice() {
                 [a] => [*a, *a, *a, *a],
@@ -1047,15 +1868,382 @@ fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>) {
             .and_then(parse_length)
             .filter(|l| non_negative(*l) && !matches!(l, Length::Pct(_) | Length::Auto))
             .map(Decl::BorderSpacing),
+        "position" => match lower.as_str() {
+            "static" => Some(Position::Static),
+            "relative" => Some(Position::Relative),
+            "absolute" => Some(Position::Absolute),
+            "fixed" => Some(Position::Fixed),
+            "sticky" | "-webkit-sticky" => Some(Position::Sticky),
+            _ => None,
+        }
+        .map(Decl::Position),
+        "top" | "right" | "bottom" | "left" => {
+            let side = match name {
+                "top" => 0,
+                "right" => 1,
+                "bottom" => 2,
+                _ => 3,
+            };
+            parse_length(&lower).map(|l| Decl::Inset(side, l))
+        }
+        "inset" => {
+            if let Some(sides) = four_sides(&lower, parse_length) {
+                out.extend(sides.into_iter().enumerate().map(|(side, l)| Decl::Inset(side, l)));
+            }
+            return;
+        }
+        "z-index" => match lower.as_str() {
+            "auto" => Some(Decl::ZIndex(None)),
+            v => v.parse::<i64>().ok().map(|z| Decl::ZIndex(Some(z.clamp(-(1 << 30), 1 << 30) as i32))),
+        },
+        "float" => match lower.as_str() {
+            "none" => Some(Float::None),
+            "left" | "inline-start" => Some(Float::Left),
+            "right" | "inline-end" => Some(Float::Right),
+            _ => None,
+        }
+        .map(Decl::Float),
+        "clear" => match lower.as_str() {
+            "none" => Some(Clear::None),
+            "left" | "inline-start" => Some(Clear::Left),
+            "right" | "inline-end" => Some(Clear::Right),
+            "both" | "all" => Some(Clear::Both),
+            _ => None,
+        }
+        .map(Decl::Clear),
+        "overflow" | "overflow-x" | "overflow-y" => {
+            let vals: Option<Vec<bool>> = lower.split_whitespace().map(parse_overflow).collect();
+            let axes: &[usize] = match name {
+                "overflow-x" => &[0],
+                "overflow-y" => &[1],
+                _ => &[0, 1],
+            };
+            match vals.as_deref() {
+                Some([v]) => out.extend(axes.iter().map(|&a| Decl::Overflow(a, *v))),
+                Some([x, y]) if axes.len() == 2 => out.extend([Decl::Overflow(0, *x), Decl::Overflow(1, *y)]),
+                _ => {}
+            }
+            return;
+        }
+        "height" => parse_size(&lower).map(Decl::Height),
+        "min-height" => parse_size(&lower).map(Decl::MinHeight),
+        "min-width" => parse_size(&lower).map(Decl::MinWidth),
+        "max-height" => {
+            if lower == "none" {
+                Some(Decl::MaxHeight(None))
+            } else {
+                parse_size(&lower).filter(|l| *l != Length::Auto).map(|l| Decl::MaxHeight(Some(l)))
+            }
+        }
+        "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            let sides: &[usize] = match name {
+                "border-top" => &[0],
+                "border-right" => &[1],
+                "border-bottom" => &[2],
+                "border-left" => &[3],
+                _ => &[0, 1, 2, 3],
+            };
+            parse_border_shorthand(&lower, sides, out);
+            return;
+        }
+        "border-width" | "border-style" | "border-color" => {
+            match name {
+                "border-width" => {
+                    if let Some(s) = four_sides(&lower, parse_border_width) {
+                        out.extend(s.into_iter().enumerate().map(|(i, l)| Decl::BorderWidth(i, l)));
+                    }
+                }
+                "border-style" => {
+                    if let Some(s) = four_sides(&lower, parse_border_style) {
+                        out.extend(s.into_iter().enumerate().map(|(i, v)| Decl::BorderStyle(i, v)));
+                    }
+                }
+                _ => {
+                    let colors: Option<Vec<ColorValue>> = words(&lower).into_iter().map(parse_color).collect();
+                    if let Some(s) = colors.as_deref().and_then(expand_sides) {
+                        out.extend(s.into_iter().enumerate().map(|(i, c)| Decl::BorderColor(i, c)));
+                    }
+                }
+            }
+            return;
+        }
+        n if n.starts_with("border-") && n.ends_with("-width") => {
+            side_of(n).zip(parse_border_width(&lower)).map(|(s, l)| Decl::BorderWidth(s, l))
+        }
+        n if n.starts_with("border-") && n.ends_with("-style") => {
+            side_of(n).zip(parse_border_style(&lower)).map(|(s, v)| Decl::BorderStyle(s, v))
+        }
+        n if n.starts_with("border-") && n.ends_with("-color") => {
+            side_of(n).zip(parse_color(&lower)).map(|(s, c)| Decl::BorderColor(s, c))
+        }
+        "border-radius" => words(&lower)
+            .first()
+            .and_then(|t| parse_length(t.split('/').next().unwrap_or("")))
+            .filter(|l| non_negative(*l) && *l != Length::Auto)
+            .map(Decl::BorderRadius),
+        "flex-direction" => parse_flex_direction(&lower).map(Decl::FlexDirection),
+        "flex-wrap" => parse_flex_wrap(&lower).map(Decl::FlexWrap),
+        "flex-flow" => {
+            for t in lower.split_whitespace() {
+                if let Some(d) = parse_flex_direction(t) {
+                    out.push(Decl::FlexDirection(d));
+                } else if let Some(w) = parse_flex_wrap(t) {
+                    out.push(Decl::FlexWrap(w));
+                }
+            }
+            return;
+        }
+        "justify-content" => parse_justify(&lower).map(Decl::JustifyContent),
+        "align-content" => parse_justify(&lower).map(Decl::AlignContent),
+        "place-content" => {
+            let mut it = lower.split_whitespace();
+            let first = it.next().and_then(parse_justify);
+            let second = it.next().map_or(first, parse_justify);
+            if let (Some(a), Some(j)) = (first, second) {
+                out.extend([Decl::AlignContent(a), Decl::JustifyContent(j)]);
+            }
+            return;
+        }
+        "align-items" => parse_align(&lower).filter(|a| *a != Align::Auto).map(Decl::AlignItems),
+        "place-items" => {
+            lower.split_whitespace().next().and_then(parse_align).filter(|a| *a != Align::Auto).map(Decl::AlignItems)
+        }
+        "align-self" => parse_align(&lower).map(Decl::AlignSelf),
+        "flex-grow" => parse_number(&lower).filter(|n| *n >= 0.0).map(|n| Decl::FlexGrow(n.min(1e6))),
+        "flex-shrink" => parse_number(&lower).filter(|n| *n >= 0.0).map(|n| Decl::FlexShrink(n.min(1e6))),
+        "flex-basis" => parse_flex_basis(&lower).map(Decl::FlexBasis),
+        "flex" => {
+            parse_flex_shorthand(&lower, out);
+            return;
+        }
+        "order" => lower.parse::<i64>().ok().map(|o| Decl::Order(o.clamp(-(1 << 30), 1 << 30) as i32)),
+        "gap" | "grid-gap" => {
+            let vals: Option<Vec<Length>> = words(&lower).into_iter().map(parse_gap).collect();
+            match vals.as_deref() {
+                Some([g]) => out.extend([Decl::Gap(0, *g), Decl::Gap(1, *g)]),
+                Some([r, c]) => out.extend([Decl::Gap(0, *r), Decl::Gap(1, *c)]),
+                _ => {}
+            }
+            return;
+        }
+        "row-gap" | "grid-row-gap" => parse_gap(&lower).map(|g| Decl::Gap(0, g)),
+        "mask" | "mask-image" | "-webkit-mask" | "-webkit-mask-image" => Some(Decl::Masked(lower != "none")),
+        "column-gap" | "grid-column-gap" => parse_gap(&lower).map(|g| Decl::Gap(1, g)),
         _ => None,
     };
     out.extend(decl);
 }
 
+const BORDER_ALL: [Prop; 12] = [
+    Prop::BorderWidth(0),
+    Prop::BorderWidth(1),
+    Prop::BorderWidth(2),
+    Prop::BorderWidth(3),
+    Prop::BorderStyle(0),
+    Prop::BorderStyle(1),
+    Prop::BorderStyle(2),
+    Prop::BorderStyle(3),
+    Prop::BorderColor(0),
+    Prop::BorderColor(1),
+    Prop::BorderColor(2),
+    Prop::BorderColor(3),
+];
+
+/// `border-top-width` -> 0, ..., `border-left-color` -> 3.
+fn side_of(name: &str) -> Option<usize> {
+    let side = name.strip_prefix("border-")?.split('-').next()?;
+    Some(match side {
+        "top" | "block-start" => 0,
+        "right" | "inline-end" => 1,
+        "bottom" | "block-end" => 2,
+        "left" | "inline-start" => 3,
+        _ => return None,
+    })
+}
+
+/// One to four values expanded to top, right, bottom, left.
+fn expand_sides<T: Copy>(vals: &[T]) -> Option<[T; 4]> {
+    Some(match *vals {
+        [a] => [a, a, a, a],
+        [a, b] => [a, b, a, b],
+        [a, b, c] => [a, b, c, b],
+        [a, b, c, d] => [a, b, c, d],
+        _ => return None,
+    })
+}
+
+fn four_sides<T: Copy>(v: &str, parse: impl Fn(&str) -> Option<T>) -> Option<[T; 4]> {
+    let vals: Option<Vec<T>> = words(v).into_iter().map(parse).collect();
+    expand_sides(&vals?)
+}
+
+fn parse_overflow(v: &str) -> Option<bool> {
+    match v {
+        "visible" => Some(false),
+        "hidden" | "clip" | "auto" | "scroll" | "overlay" => Some(true),
+        _ => None,
+    }
+}
+
+/// `width`-like values: non-negative lengths, `auto`, and the intrinsic
+/// size keywords.
+fn parse_size(v: &str) -> Option<Length> {
+    match v {
+        "min-content" | "-webkit-min-content" | "-moz-min-content" => Some(Length::MinContent),
+        "max-content" | "-webkit-max-content" | "-moz-max-content" => Some(Length::MaxContent),
+        "fit-content" | "-webkit-fit-content" | "-moz-fit-content" | "-webkit-fill-available" | "stretch" => {
+            Some(if v.contains("fill") || v == "stretch" { Length::Auto } else { Length::FitContent })
+        }
+        _ => parse_length(v).filter(|l| non_negative(*l)),
+    }
+}
+
+fn parse_border_width(v: &str) -> Option<Length> {
+    match v {
+        "thin" => Some(Length::Px(1.0)),
+        "medium" => Some(Length::Px(3.0)),
+        "thick" => Some(Length::Px(5.0)),
+        _ => parse_length(v).filter(|l| non_negative(*l) && !matches!(l, Length::Pct(_) | Length::Auto)),
+    }
+}
+
+fn parse_border_style(v: &str) -> Option<bool> {
+    match v {
+        "none" | "hidden" => Some(false),
+        "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset" => Some(true),
+        _ => None,
+    }
+}
+
+/// `border: 1px solid red` and the per-side forms. Omitted parts reset to
+/// their initial values, as for every shorthand.
+fn parse_border_shorthand(v: &str, sides: &[usize], out: &mut Vec<Decl>) {
+    let (mut width, mut style, mut color) = (None, None, None);
+    for t in words(v) {
+        if width.is_none()
+            && let Some(w) = parse_border_width(t)
+        {
+            width = Some(w);
+        } else if style.is_none()
+            && let Some(s) = parse_border_style(t)
+        {
+            style = Some(s);
+        } else if color.is_none()
+            && let Some(c) = parse_color(t)
+        {
+            color = Some(c);
+        } else {
+            return;
+        }
+    }
+    for &s in sides {
+        out.push(Decl::BorderWidth(s, width.unwrap_or(Length::Px(3.0))));
+        out.push(Decl::BorderStyle(s, style.unwrap_or(false)));
+        out.push(Decl::BorderColor(s, color.unwrap_or(ColorValue::Current)));
+    }
+}
+
+fn parse_flex_direction(v: &str) -> Option<FlexDirection> {
+    match v {
+        "row" => Some(FlexDirection::Row),
+        "row-reverse" => Some(FlexDirection::RowReverse),
+        "column" => Some(FlexDirection::Column),
+        "column-reverse" => Some(FlexDirection::ColumnReverse),
+        _ => None,
+    }
+}
+
+fn parse_flex_wrap(v: &str) -> Option<bool> {
+    match v {
+        "nowrap" => Some(false),
+        "wrap" | "wrap-reverse" => Some(true),
+        _ => None,
+    }
+}
+
+fn parse_justify(v: &str) -> Option<Justify> {
+    let v = v.trim_start_matches("safe ").trim_start_matches("unsafe ").trim();
+    match v {
+        "flex-start" | "start" | "left" | "normal" | "baseline" | "first baseline" | "last baseline" => {
+            Some(Justify::Start)
+        }
+        "flex-end" | "end" | "right" => Some(Justify::End),
+        "center" => Some(Justify::Center),
+        "space-between" => Some(Justify::SpaceBetween),
+        "space-around" => Some(Justify::SpaceAround),
+        "space-evenly" => Some(Justify::SpaceEvenly),
+        "stretch" => Some(Justify::Stretch),
+        _ => None,
+    }
+}
+
+fn parse_align(v: &str) -> Option<Align> {
+    let v = v.trim_start_matches("safe ").trim_start_matches("unsafe ").trim();
+    match v {
+        "auto" => Some(Align::Auto),
+        "stretch" | "normal" => Some(Align::Stretch),
+        "flex-start" | "start" | "self-start" | "left" => Some(Align::Start),
+        "flex-end" | "end" | "self-end" | "right" => Some(Align::End),
+        "center" => Some(Align::Center),
+        "baseline" | "first baseline" | "last baseline" => Some(Align::Baseline),
+        _ => None,
+    }
+}
+
+fn parse_flex_basis(v: &str) -> Option<Length> {
+    match v {
+        "content" => Some(Length::Auto),
+        _ => parse_size(v),
+    }
+}
+
+/// `flex: none | auto | <grow> <shrink>? || <basis>`.
+fn parse_flex_shorthand(v: &str, out: &mut Vec<Decl>) {
+    let (grow, shrink, basis) = match v {
+        "none" => (0.0, 0.0, Length::Auto),
+        "auto" => (1.0, 1.0, Length::Auto),
+        _ => {
+            let mut nums = Vec::new();
+            let mut basis = None;
+            for t in words(v) {
+                if let Some(n) = parse_number(t)
+                    && nums.len() < 2
+                    && n >= 0.0
+                {
+                    nums.push(n.min(1e6));
+                } else if basis.is_none()
+                    && let Some(b) = parse_flex_basis(t)
+                {
+                    basis = Some(b);
+                } else {
+                    return;
+                }
+            }
+            if nums.is_empty() && basis.is_none() {
+                return;
+            }
+            // A bare number means a zero basis; a bare basis means `1 1 <basis>`.
+            let grow = nums.first().copied().unwrap_or(1.0);
+            let shrink = nums.get(1).copied().unwrap_or(1.0);
+            (grow, shrink, basis.unwrap_or(Length::Pct(0.0)))
+        }
+    };
+    out.extend([Decl::FlexGrow(grow), Decl::FlexShrink(shrink), Decl::FlexBasis(basis)]);
+}
+
+fn parse_gap(v: &str) -> Option<Length> {
+    match v {
+        "normal" => Some(Length::Px(0.0)),
+        _ => parse_length(v).filter(|l| non_negative(*l) && *l != Length::Auto),
+    }
+}
+
+/// False only for lengths that are negative at parse time. A `calc()` that
+/// turns out negative is clamped where it is used, as CSS says.
 fn non_negative(l: Length) -> bool {
     match l {
         Length::Px(v) | Length::Em(v) | Length::Rem(v) | Length::Pct(v) => v >= 0.0,
-        Length::Auto => true,
+        _ => true,
     }
 }
 
@@ -1064,25 +2252,36 @@ fn is_valid_padding(l: Length) -> bool {
 }
 
 pub(crate) fn parse_display(v: &str) -> Option<Display> {
-    // Multi-keyword syntax: `block flow`, `inline flex`, ...
-    let mut outer = None;
-    let mut list_item = false;
-    for t in v.split_whitespace() {
-        match t {
-            "list-item" => list_item = true,
-            "flow" | "flow-root" => {}
-            _ => outer = Some(t),
-        }
-    }
-    if list_item {
+    // Multi-keyword syntax: `block flow`, `inline flex`, `block flow-root`.
+    let words: Vec<&str> = v.split_whitespace().collect();
+    if words.contains(&"list-item") {
         return Some(Display::ListItem);
     }
-    Some(match outer? {
+    let one = match words.as_slice() {
+        [w] => *w,
+        ["block", "flow"] | ["flow", "block"] => "block",
+        ["inline", "flow"] | ["flow", "inline"] => "inline",
+        ["block", "flow-root"] | ["flow-root", "block"] => "flow-root",
+        ["inline", "flow-root"] | ["flow-root", "inline"] => "inline-block",
+        ["block", inner] | [inner, "block"] => inner,
+        ["inline", "flex"] | ["flex", "inline"] => "inline-flex",
+        ["inline", "grid"] | ["grid", "inline"] => "inline-grid",
+        ["inline", "table"] | ["table", "inline"] => "inline-table",
+        _ => return None,
+    };
+    Some(match one {
         "none" => Display::None,
-        "inline" | "inline-block" | "inline-flex" | "inline-grid" | "inline-table" | "contents" | "ruby" => {
-            Display::Inline
-        }
-        "block" | "flex" | "grid" | "-webkit-box" | "-webkit-flex" | "-ms-flexbox" | "table-caption" => Display::Block,
+        "inline" | "ruby" => Display::Inline,
+        "contents" => Display::Contents,
+        "inline-block" | "-webkit-inline-box" => Display::InlineBlock,
+        // Laid out as a block-level table: close enough without inline tables.
+        "inline-table" => Display::Table,
+        "inline-flex" | "-webkit-inline-flex" | "-ms-inline-flexbox" => Display::InlineFlex,
+        "inline-grid" | "-ms-inline-grid" => Display::InlineGrid,
+        "block" | "-webkit-box" | "table-caption" => Display::Block,
+        "flow-root" => Display::FlowRoot,
+        "flex" | "-webkit-flex" | "-ms-flexbox" => Display::Flex,
+        "grid" | "-ms-grid" => Display::Grid,
         "table" => Display::Table,
         "table-row-group" | "table-header-group" | "table-footer-group" => Display::TableRowGroup,
         "table-row" => Display::TableRow,
@@ -1115,6 +2314,9 @@ pub(crate) fn parse_length(t: &str) -> Option<Length> {
     if t.eq_ignore_ascii_case("auto") {
         return Some(Length::Auto);
     }
+    if let Some(open) = t.find('(') {
+        return parse_math(&t[..open].to_ascii_lowercase(), t[open + 1..].strip_suffix(')')?);
+    }
     let (n, unit) = split_number(t)?;
     let n = n.clamp(-1e6, 1e6);
     Some(match unit.to_ascii_lowercase().as_str() {
@@ -1129,9 +2331,176 @@ pub(crate) fn parse_length(t: &str) -> Option<Length> {
         "mm" => Length::Px(n * 96.0 / 25.4),
         "q" => Length::Px(n * 96.0 / 101.6),
         "ex" | "ch" => Length::Em(n * 0.5),
+        "vw" | "svw" | "lvw" | "dvw" | "vi" | "vmax" => Length::Calc(Calc { vw: n, ..Calc::default() }),
+        "vh" | "svh" | "lvh" | "dvh" | "vb" | "vmin" => Length::Calc(Calc { vw: n * VH_PER_VW, ..Calc::default() }),
         "" if n == 0.0 => Length::Px(0.0),
         _ => return None,
     })
+}
+
+/// Layout never sees the viewport height (it must not influence the page,
+/// and the window is letterboxed anyway), so `vh` assumes a 16:9 viewport.
+const VH_PER_VW: f32 = 0.5625;
+const MAX_MATH_DEPTH: usize = 16;
+const MAX_MATH_TOKENS: usize = 256;
+
+/// `calc()`, `min()`, `max()` and `clamp()`. `min`/`max`/`clamp` may not mix
+/// in percentages (the result would depend on the containing block in a
+/// non-linear way) and take at most three arguments.
+fn parse_math(name: &str, inner: &str) -> Option<Length> {
+    let simplify = |c: Calc| -> Length {
+        if c.em == 0.0 && c.rem == 0.0 && c.vw == 0.0 {
+            if c.pct == 0.0 {
+                return Length::Px(c.px);
+            }
+            if c.px == 0.0 {
+                return Length::Pct(c.pct);
+            }
+        }
+        Length::Calc(c)
+    };
+    match name {
+        "calc" | "-webkit-calc" | "-moz-calc" => match eval_math(inner)? {
+            // A bare number is only a length when it is zero.
+            (c, true) if c.px != 0.0 => None,
+            (c, _) => Some(simplify(c)),
+        },
+        "min" | "max" | "clamp" => {
+            let args: Option<Vec<Calc>> = split_top_level(inner, b',')
+                .into_iter()
+                .map(|a| match eval_math(a)? {
+                    (c, false) if c.pct == 0.0 => Some(c),
+                    (c, true) if c.px == 0.0 => Some(c),
+                    _ => None,
+                })
+                .collect();
+            let inf = |sign: f32| Calc { px: sign * f32::INFINITY, ..Calc::default() };
+            match (name, args?.as_slice()) {
+                ("min" | "max", [a]) => Some(simplify(*a)),
+                ("min", [a, b]) => Some(Length::Clamp(inf(-1.0), *a, *b)),
+                ("max", [a, b]) => Some(Length::Clamp(*a, *b, inf(1.0))),
+                ("clamp", [a, b, c]) => Some(Length::Clamp(*a, *b, *c)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum MathToken {
+    /// A value, and whether it is a plain number.
+    Value(Calc, bool),
+    Op(u8),
+    Open,
+    Close,
+}
+
+/// Evaluates a math expression to a linear sum; the flag is true for a
+/// plain number. Products need a number on one side, quotients a nonzero
+/// number on the right.
+fn eval_math(s: &str) -> Option<(Calc, bool)> {
+    let tokens = math_tokens(s)?;
+    let mut pos = 0;
+    let v = math_sum(&tokens, &mut pos, 0)?;
+    (pos == tokens.len()).then_some(v)
+}
+
+fn math_tokens(s: &str) -> Option<Vec<MathToken>> {
+    let mut tokens = Vec::new();
+    let mut rest = s.trim_start();
+    while !rest.is_empty() {
+        if tokens.len() >= MAX_MATH_TOKENS {
+            return None;
+        }
+        let after_value = matches!(tokens.last(), Some(MathToken::Value(..) | MathToken::Close));
+        let c = rest.as_bytes()[0];
+        let len = match c {
+            b'(' => {
+                tokens.push(MathToken::Open);
+                1
+            }
+            b')' => {
+                tokens.push(MathToken::Close);
+                1
+            }
+            b'*' | b'/' => {
+                tokens.push(MathToken::Op(c));
+                1
+            }
+            b'+' | b'-' if after_value => {
+                tokens.push(MathToken::Op(c));
+                1
+            }
+            c if c.is_ascii_alphabetic() => {
+                // Nested functions: only `calc(`, which is just parentheses.
+                let open = rest.find('(')?;
+                if !rest[..open].eq_ignore_ascii_case("calc") {
+                    return None;
+                }
+                tokens.push(MathToken::Open);
+                open + 1
+            }
+            _ => {
+                let end = rest.find(|ch: char| ch.is_ascii_whitespace() || "()*/".contains(ch)).unwrap_or(rest.len());
+                let tok = &rest[..end];
+                tokens.push(match parse_number(tok) {
+                    Some(n) => MathToken::Value(Calc { px: n, ..Calc::default() }, true),
+                    None => MathToken::Value(Calc::of(parse_length(tok)?)?, false),
+                });
+                end
+            }
+        };
+        rest = rest[len..].trim_start();
+    }
+    Some(tokens)
+}
+
+fn math_sum(t: &[MathToken], pos: &mut usize, depth: usize) -> Option<(Calc, bool)> {
+    let (mut acc, number) = math_product(t, pos, depth)?;
+    while let Some(&MathToken::Op(op @ (b'+' | b'-'))) = t.get(*pos) {
+        *pos += 1;
+        let (rhs, rhs_number) = math_product(t, pos, depth)?;
+        if rhs_number != number {
+            return None;
+        }
+        acc = acc.plus(if op == b'-' { rhs.scaled(-1.0) } else { rhs });
+    }
+    Some((acc, number))
+}
+
+fn math_product(t: &[MathToken], pos: &mut usize, depth: usize) -> Option<(Calc, bool)> {
+    let mut acc = math_value(t, pos, depth)?;
+    while let Some(&MathToken::Op(op @ (b'*' | b'/'))) = t.get(*pos) {
+        *pos += 1;
+        let rhs = math_value(t, pos, depth)?;
+        acc = match (op, acc.1, rhs.1) {
+            (b'*', true, _) => (rhs.0.scaled(acc.0.px), rhs.1),
+            (b'*', false, true) => (acc.0.scaled(rhs.0.px), false),
+            (b'/', _, true) if rhs.0.px != 0.0 => (acc.0.scaled(1.0 / rhs.0.px), acc.1),
+            _ => return None,
+        };
+    }
+    Some(acc)
+}
+
+fn math_value(t: &[MathToken], pos: &mut usize, depth: usize) -> Option<(Calc, bool)> {
+    match *t.get(*pos)? {
+        MathToken::Value(c, n) => {
+            *pos += 1;
+            Some((c, n))
+        }
+        MathToken::Open if depth < MAX_MATH_DEPTH => {
+            *pos += 1;
+            let v = math_sum(t, pos, depth + 1)?;
+            if t.get(*pos) != Some(&MathToken::Close) {
+                return None;
+            }
+            *pos += 1;
+            Some(v)
+        }
+        _ => None,
+    }
 }
 
 /// Splits `12.5px` into (12.5, "px"). Rust's float parsing is correctly
@@ -1613,14 +2982,23 @@ const NAMED_COLORS: &[(&str, u32)] = &[
 mod tests {
     use super::*;
 
-    fn el(name: &str, id: Option<&str>, classes: &[&str]) -> Element {
-        Element {
-            name: name.into(),
-            id: id.map(Into::into),
-            classes: classes.iter().map(|c| c.to_string()).collect(),
-            attrs: vec![],
-            has_href: false,
-        }
+    fn doc(html: &str) -> Dom {
+        crate::dom::parse(html, &url::Url::parse("https://example.org/").unwrap()).dom
+    }
+
+    /// The element with `id=...`.
+    fn by_id(dom: &Dom, id: &str) -> NodeId {
+        (0..dom.nodes.len()).find(|&n| dom.element(n).is_some_and(|e| e.id.as_deref() == Some(id))).expect(id)
+    }
+
+    fn sel(s: &str) -> Selector {
+        parse_selector(s, 0).unwrap_or_else(|| panic!("{s} should parse"))
+    }
+
+    /// A matcher for one document: `m(selector, id)`.
+    fn matcher(html: &str) -> impl Fn(&str, &str) -> bool + use<> {
+        let dom = doc(html);
+        move |s, id| sel(s).matches(&Tree::new(&dom), by_id(&dom, id))
     }
 
     #[test]
@@ -1655,54 +3033,382 @@ mod tests {
         assert_eq!(parse_length("0"), Some(Length::Px(0.0)));
         assert_eq!(parse_length("auto"), Some(Length::Auto));
         assert_eq!(parse_length("12"), None);
-        assert_eq!(parse_length("10vw"), None);
-        assert_eq!(parse_length("calc(1px + 2px)"), None);
+        assert_eq!(parse_length("10vw"), Some(Length::Calc(Calc { vw: 10.0, ..Calc::default() })));
         assert_eq!(parse_length("1e400px"), None);
     }
 
     #[test]
+    fn parses_math() {
+        let calc = |px, em, pct| Length::Calc(Calc { px, em, pct, ..Calc::default() });
+        assert_eq!(parse_length("calc(1px + 2px)"), Some(Length::Px(3.0)));
+        assert_eq!(parse_length("calc(100% - 2 * 10px)"), Some(calc(-20.0, 0.0, 100.0)));
+        assert_eq!(parse_length("calc((1em + 4px) / 2)"), Some(calc(2.0, 0.5, 0.0)));
+        assert_eq!(parse_length("calc(50% - calc(1em - 2px))"), Some(calc(2.0, -1.0, 50.0)));
+        assert_eq!(parse_length("CALC(0)"), Some(Length::Px(0.0)));
+        // Invalid: unit times unit, division by zero or a length, bare numbers.
+        assert_eq!(parse_length("calc(1px * 2px)"), None);
+        assert_eq!(parse_length("calc(1px / 0)"), None);
+        assert_eq!(parse_length("calc(1px / 1px)"), None);
+        assert_eq!(parse_length("calc(1px + 2)"), None);
+        assert_eq!(parse_length("calc(3)"), None);
+        assert_eq!(parse_length("calc(1px + )"), None);
+        assert_eq!(parse_length("calc(1px"), None);
+        let px = |v| Calc { px: v, ..Calc::default() };
+        let inf = |s: f32| Calc { px: s * f32::INFINITY, ..Calc::default() };
+        assert_eq!(
+            parse_length("min(10px, 2em)"),
+            Some(Length::Clamp(inf(-1.0), px(10.0), Calc { em: 2.0, ..px(0.0) }))
+        );
+        assert_eq!(parse_length("max(10px,20px)"), Some(Length::Clamp(px(10.0), px(20.0), inf(1.0))));
+        assert_eq!(parse_length("clamp(1px, 2px, 3px)"), Some(Length::Clamp(px(1.0), px(2.0), px(3.0))));
+        assert_eq!(parse_length("min(100%, 10px)"), None, "percentages can't be clamped yet");
+        // Hostile nesting and length stay bounded.
+        let deep = format!("calc({}1px{})", "(".repeat(5000), ")".repeat(5000));
+        assert_eq!(parse_length(&deep), None);
+        let long = format!("calc({})", vec!["1px"; 10_000].join(" + "));
+        assert_eq!(parse_length(&long), None);
+    }
+
+    #[test]
+    fn parses_layout_properties() {
+        let decls = |css: &str| parse_declarations(css).into_iter().map(|d| d.decl).collect::<Vec<_>>();
+        assert_eq!(
+            decls("border: 2px solid red"),
+            [0, 1, 2, 3]
+                .into_iter()
+                .flat_map(|s| [
+                    Decl::BorderWidth(s, Length::Px(2.0)),
+                    Decl::BorderStyle(s, true),
+                    Decl::BorderColor(s, ColorValue::Rgba(Color::rgb(255, 0, 0)))
+                ])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(decls("border-left-width: thick"), [Decl::BorderWidth(3, Length::Px(5.0))]);
+        assert_eq!(
+            decls("border-style: none solid"),
+            [
+                Decl::BorderStyle(0, false),
+                Decl::BorderStyle(1, true),
+                Decl::BorderStyle(2, false),
+                Decl::BorderStyle(3, true)
+            ]
+        );
+        assert_eq!(decls("flex: 1"), [Decl::FlexGrow(1.0), Decl::FlexShrink(1.0), Decl::FlexBasis(Length::Pct(0.0))]);
+        assert_eq!(decls("flex: none"), [Decl::FlexGrow(0.0), Decl::FlexShrink(0.0), Decl::FlexBasis(Length::Auto)]);
+        assert_eq!(
+            decls("flex: 2 0 10px"),
+            [Decl::FlexGrow(2.0), Decl::FlexShrink(0.0), Decl::FlexBasis(Length::Px(10.0))]
+        );
+        assert_eq!(
+            decls("flex: 20%"),
+            [Decl::FlexGrow(1.0), Decl::FlexShrink(1.0), Decl::FlexBasis(Length::Pct(20.0))]
+        );
+        assert_eq!(decls("flex-flow: column wrap"), [Decl::FlexDirection(FlexDirection::Column), Decl::FlexWrap(true)]);
+        assert_eq!(decls("gap: 1px 2px"), [Decl::Gap(0, Length::Px(1.0)), Decl::Gap(1, Length::Px(2.0))]);
+        assert_eq!(decls("justify-content: space-between"), [Decl::JustifyContent(Justify::SpaceBetween)]);
+        assert_eq!(decls("align-items: flex-end"), [Decl::AlignItems(Align::End)]);
+        assert_eq!(
+            decls("position: absolute; top: 0; inset: 1px 2px"),
+            [
+                Decl::Position(Position::Absolute),
+                Decl::Inset(0, Length::Px(0.0)),
+                Decl::Inset(0, Length::Px(1.0)),
+                Decl::Inset(1, Length::Px(2.0)),
+                Decl::Inset(2, Length::Px(1.0)),
+                Decl::Inset(3, Length::Px(2.0))
+            ]
+        );
+        assert_eq!(decls("overflow: hidden visible"), [Decl::Overflow(0, true), Decl::Overflow(1, false)]);
+        assert_eq!(
+            decls("height: fit-content; max-height: none"),
+            [Decl::Height(Length::FitContent), Decl::MaxHeight(None)]
+        );
+        assert_eq!(
+            decls("margin: 0 calc(50% - 10px)")[1],
+            Decl::Margin(1, Length::Calc(Calc { px: -10.0, pct: 50.0, ..Calc::default() }))
+        );
+        assert_eq!(decls("z-index: 99999999999"), [Decl::ZIndex(Some(1 << 30))]);
+        assert_eq!(parse_display("inline flex"), Some(Display::InlineFlex));
+        assert_eq!(parse_display("block flow-root"), Some(Display::FlowRoot));
+        assert_eq!(parse_display("flow-root"), Some(Display::FlowRoot));
+        // Invalid values add nothing.
+        assert!(decls("border: 1px solid red blue; flex: 1 2 3; height: -5px; float: up").is_empty());
+    }
+
+    #[test]
     fn specificity_orders_ids_classes_types() {
-        let s = |t| parse_selector(t).unwrap().specificity;
+        let s = |t| sel(t).specificity;
         assert!(s("#a") > s(".a.b.c"));
         assert!(s(".a") > s("div p span"));
         assert!(s("a.btn") > s(".btn"));
         assert_eq!(s("*"), 0);
         assert_eq!(s("ul li a:link"), (1 << 8) | 3);
+        assert_eq!(s("[type=text]"), 1 << 8);
+        assert_eq!(s("li:nth-child(2n+1)"), (1 << 8) | 1);
+        assert_eq!(s("a:only-child"), (1 << 8) | 1);
+        assert_eq!(s("h2 + p ~ p"), 3);
+        // Selectors 4: `:is()` and `:not()` count their most specific
+        // argument, `:where()` counts nothing.
+        assert_eq!(s(":is(#a, .b, p)"), 1 << 16);
+        assert_eq!(s("p:not(.a, .b.c)"), (2 << 8) | 1);
+        assert_eq!(s(":where(#a .b) p"), 1);
+        assert_eq!(s(":not(:where(#a))"), 0);
     }
 
     #[test]
     fn rejects_unsupported_selectors() {
-        assert!(parse_selector("a + b").is_none());
-        assert!(parse_selector("a ~ b").is_none());
-        assert!(parse_selector("p::before").is_none());
-        assert!(parse_selector("[type=text]").is_none());
-        assert!(parse_selector("li:nth-child(2)").is_none());
-        assert!(parse_selector("> a").is_none());
-        // One bad selector drops the whole list, as CSS requires.
+        for bad in [
+            "p::before",
+            "a:before",
+            "> a",
+            "a > > b",
+            "a + + b",
+            "a +",
+            "a ~",
+            "li:nth-child(2n of .x)",
+            "li:nth-child(2 n)",
+            "li:nth-child(n+)",
+            "li:nth-child(2n+-1)",
+            "li:nth-child(99999999999)",
+            ":has(a)",
+            "[ns|a]",
+            "[a=b c]",
+            "[a",
+            "[a='b]",
+            "[=b]",
+            ":not()",
+            ":not(p::before)",
+            ":dir(up)",
+            ":lang()",
+        ] {
+            assert!(parse_selector(bad, 0).is_none(), "{bad}");
+        }
+        // One bad selector drops the whole list, as CSS requires...
         assert!(parse_selector_list("h1, p::after").is_none());
         assert_eq!(parse_selector_list("h1, .x > p").unwrap().len(), 2);
+        // ...but `:is()` and `:where()` forgive bad arguments.
+        assert!(parse_selector(":is(p::before, a)", 0).is_some());
+        assert!(parse_selector(":where(:unknown)", 0).is_some());
     }
 
     #[test]
     fn matches_descendant_and_child() {
-        let html = el("html", None, &[]);
-        let div = el("div", Some("main"), &["box", "wide"]);
-        let p = el("p", None, &["note"]);
-        let chain = [&p, &div, &html];
-        let m = |sel: &str| parse_selector(sel).unwrap().matches(&chain);
-        assert!(m("p"));
-        assert!(m("div p"));
-        assert!(m("html p"));
-        assert!(m("div > p"));
-        assert!(m("html > div > p.note"));
-        assert!(m("#main .note"));
-        assert!(m(".box.wide p"));
-        assert!(!m("html > p"));
-        assert!(!m(".missing p"));
-        assert!(!m("p div"));
-        assert!(!m("p:hover"));
-        assert!(m("* p"));
-        assert!(parse_selector(":root").unwrap().matches(&[&html]));
+        let m = matcher("<html><body><div id=main class='box wide'><p id=p class=note>x</p></div></body></html>");
+        for yes in
+            ["p", "div p", "html p", "div > p", "html > body > div > p.note", "#main .note", ".box.wide p", "* p"]
+        {
+            assert!(m(yes, "p"), "{yes}");
+        }
+        for no in ["html > p", ".missing p", "p div", "p:hover", "div > div p", "#main#main p"] {
+            assert!(!m(no, "p"), "{no}");
+        }
+        let root = matcher("<html id=h><body id=b>");
+        assert!(root(":root", "h"));
+        assert!(root(":scope > body", "b"));
+        assert!(!root(":root", "b"));
+    }
+
+    #[test]
+    fn sibling_combinators() {
+        let m = matcher(
+            "<h2 id=h>t</h2><p id=a>1</p> text <p id=b>2</p><div id=d></div>
+             <input type=checkbox id=c checked><span id=s></span><ul><li id=l></li></ul>",
+        );
+        assert!(m("h2 + p", "a"));
+        assert!(!m("h2 + p", "b"));
+        assert!(m("p + p", "b"), "text between siblings doesn't count");
+        assert!(m("h2 ~ p", "b"));
+        assert!(m("h2 ~ p + div", "d"));
+        assert!(!m("div ~ p", "a"));
+        assert!(!m("p ~ h2", "h"));
+        assert!(m("input:checked ~ span", "s"));
+        assert!(m(":checked + span", "s"));
+        assert!(m("h2 ~ ul > li", "l"));
+        assert!(m("h2 ~ ul li", "l"));
+        assert!(m("body > h2 ~ * li", "l"));
+        assert!(!m("h2 + ul li", "l"));
+        assert!(!m("li ~ li", "l"));
+    }
+
+    #[test]
+    fn checked_is_static() {
+        let m = matcher(
+            "<input type=checkbox id=a checked><input type=checkbox id=b><input type=text id=c checked>
+             <input type=RADIO id=r checked><select><option id=o selected>x</option><option id=p>y</option></select>",
+        );
+        let checked: Vec<&str> = ["a", "b", "c", "r", "o", "p"].into_iter().filter(|id| m(":checked", id)).collect();
+        assert_eq!(checked, ["a", "r", "o"]);
+    }
+
+    #[test]
+    fn attribute_selectors() {
+        let m = matcher(
+            r#"<a id=a href="https://example.org/file.PDF" lang=en-GB class="x  y" data-v="" title='a "b"' type=Text>l</a>"#,
+        );
+        for yes in [
+            "[href]",
+            "a[href]",
+            "[HREF]",
+            "[ href ]",
+            "[href^='https://']",
+            "[href$='.PDF']",
+            "[href$='.pdf' i]",
+            "[href$=\".pdf\" I]",
+            "[href*=example]",
+            "[href = 'https://example.org/file.PDF']",
+            "[class~=y]",
+            "[class~=x]",
+            "[lang|=en]",
+            "[lang=en-gb]",
+            "[data-v]",
+            "[data-v='']",
+            r#"[title='a "b"']"#,
+            r#"[title="a \"b\""]"#,
+            r"[title='a \22 b\22 ']",
+            // HTML compares `type` values case-insensitively.
+            "[type=text]",
+        ] {
+            assert!(m(yes, "a"), "{yes}");
+        }
+        for no in [
+            "[nope]",
+            "[href$='.pdf']",
+            "[href$='.pdf' s]",
+            "[href*=EXAMPLE]",
+            "[class~='x y']",
+            "[class~='']",
+            "[lang|=en-]",
+            "[lang=en]",
+            "[data-v^='']",
+            "[data-v$='']",
+            "[data-v*='']",
+            "[type=text s]",
+        ] {
+            assert!(!m(no, "a"), "{no}");
+        }
+    }
+
+    #[test]
+    fn structural_pseudo_classes() {
+        let m = matcher(
+            "<ul><li id=l1>1</li><li id=l2>2</li><li id=l3>3</li><li id=l4>4</li><li id=l5>5</li></ul>
+             <div><span id=s1></span><b id=b1></b><span id=s2></span></div>
+             <p id=e></p><p id=t> </p><p id=only><i id=i></i></p>",
+        );
+        let which =
+            |s: &str| -> Vec<&str> { ["l1", "l2", "l3", "l4", "l5"].into_iter().filter(|id| m(s, id)).collect() };
+        assert_eq!(which(":first-child"), ["l1"]);
+        assert_eq!(which(":last-child"), ["l5"]);
+        assert_eq!(which(":nth-child(odd)"), ["l1", "l3", "l5"]);
+        assert_eq!(which(":nth-child(EVEN)"), ["l2", "l4"]);
+        assert_eq!(which(":nth-child(2)"), ["l2"]);
+        assert_eq!(which(":nth-child(+2)"), ["l2"]);
+        assert_eq!(which(":nth-child(-n+2)"), ["l1", "l2"]);
+        assert_eq!(which(":nth-child(n+4)"), ["l4", "l5"]);
+        assert_eq!(which(":nth-child(3n)"), ["l3"]);
+        assert_eq!(which(":nth-child( 2n - 1 )"), ["l1", "l3", "l5"]);
+        assert_eq!(which(":nth-child(-2n+5)"), ["l1", "l3", "l5"]);
+        assert_eq!(which(":nth-child(0)"), Vec::<&str>::new());
+        assert_eq!(which(":nth-child(0n+0)"), Vec::<&str>::new());
+        assert_eq!(which(":nth-last-child(2)"), ["l4"]);
+        assert_eq!(which(":nth-last-child(-n+2)"), ["l4", "l5"]);
+        assert_eq!(which("li:not(:first-child):not(:last-child)"), ["l2", "l3", "l4"]);
+        assert_eq!(which(":only-child"), Vec::<&str>::new());
+        assert!(m("span:first-of-type", "s1"));
+        assert!(!m("span:first-of-type", "s2"));
+        assert!(m("span:last-of-type", "s2"));
+        assert!(m("span:nth-of-type(2)", "s2"));
+        assert!(m(":nth-last-of-type(1)", "s2"));
+        assert!(m("b:only-of-type", "b1"));
+        assert!(!m("span:only-of-type", "s1"));
+        assert!(!m(":first-child", "b1"));
+        assert!(m(":only-child", "i"));
+        // Whitespace counts as content, as in browsers.
+        assert!(m(":empty", "e"));
+        assert!(m(":empty", "i"));
+        assert!(!m(":empty", "t"));
+        assert!(!m(":empty", "only"));
+    }
+
+    #[test]
+    fn logical_pseudo_classes() {
+        let m = matcher("<nav id=n class=menu><a id=a href=/x class=item>x</a><a id=b class='item active'>y</a></nav>");
+        assert!(m("a:not(.active)", "a"));
+        assert!(!m("a:not(.active)", "b"));
+        assert!(m(":not(.x, .y)", "a"));
+        assert!(!m(":not(.active, .zzz)", "b"));
+        assert!(!m(":not(nav) > a", "a"));
+        assert!(m(":not(:not(.item))", "a"));
+        assert!(m(":is(nav, header) .item", "a"));
+        assert!(m(":where(.menu) :is(.active, #nope)", "b"));
+        assert!(m("a:is(:link)", "a"));
+        assert!(!m("a:is(:link)", "b"));
+        assert!(m(":is(nav > a)", "a"), "arguments are complex selectors");
+        assert!(m(":is(.menu .item):not(nav .active)", "a"));
+        assert!(m("a:not(:hover)", "a"), "a dynamic state never holds, so its negation always does");
+        assert!(!m(":is(:hover, .nope)", "a"));
+        assert!(!m(":where(:unknown)", "a"));
+    }
+
+    #[test]
+    fn lang_and_dir() {
+        let m = matcher(
+            "<div id=d lang=en-US><p id=p>x</p><p id=f lang=fr dir=rtl><span id=s>y</span></p></div>
+             <p id=n>z</p><p id=e lang=''>e</p>",
+        );
+        assert!(m(":lang(en)", "p"));
+        assert!(m(":lang(EN-us)", "p"));
+        assert!(m("div:lang(en)", "d"));
+        assert!(!m(":lang(en-GB)", "p"));
+        assert!(!m(":lang(e)", "p"));
+        assert!(m(":lang(de, fr)", "s"));
+        assert!(m(":lang(\"fr\")", "s"));
+        assert!(!m(":lang(en)", "s"));
+        assert!(!m(":lang(en)", "n"));
+        assert!(m(":lang(*)", "p"));
+        assert!(!m(":lang(*)", "n"));
+        assert!(!m(":lang(*)", "e"));
+        assert!(m(":dir(rtl)", "s"));
+        assert!(m(":dir(ltr)", "p"));
+        assert!(m(":dir(ltr)", "n"));
+    }
+
+    #[test]
+    fn hostile_selectors_are_bounded() {
+        // Deep nesting is refused at parse time, without recursing deeper.
+        let deep = ":not(".repeat(100_000) + "a" + &")".repeat(100_000);
+        assert!(parse_selector_list(&deep).is_none());
+        assert!(parse_selector_list(&":is(".repeat(100_000)).is_none());
+        let ok = ":not(".repeat(MAX_SELECTOR_NESTING) + "b" + &")".repeat(MAX_SELECTOR_NESTING);
+        assert!(parse_selector_list(&ok).is_some());
+        let too_deep = ":not(".repeat(MAX_SELECTOR_NESTING + 1) + "b" + &")".repeat(MAX_SELECTOR_NESTING + 1);
+        assert!(parse_selector_list(&too_deep).is_none());
+        // Exponential `:is()` fan-out over a deep and wide tree: the match
+        // budget bounds the work whatever the answer.
+        let mut s = "* * :not(div) ~ *".to_string();
+        for _ in 0..4 {
+            s = format!(":is({})", [s.as_str(); 8].join(", "));
+        }
+        let selector = sel(&format!("{s} {s} ~ {s} *"));
+        let dom = doc(&("<div>".repeat(200) + &"<span></span>".repeat(2000) + "<b id=t></b>"));
+        let tree = Tree::new(&dom);
+        let _ = selector.matches(&tree, by_id(&dom, "t"));
+        // Long sibling lists: nearby matches are found, far misses give up.
+        assert!(sel("span ~ b").matches(&tree, by_id(&dom, "t")));
+        assert!(!sel("i ~ b").matches(&tree, by_id(&dom, "t")));
+        // Huge attribute values.
+        let big = "a".repeat(16 * 1024);
+        let m = matcher(&format!("<p id=p data-x='{big}'></p>"));
+        assert!(m(&format!("[data-x*='{big}']"), "p"));
+        assert!(!m(&format!("[data-x*='{big}b']"), "p"));
+        assert!(m(&format!("[data-x^='{}' i]", "A".repeat(8000)), "p"));
+        assert!(m(&format!("[data-x~={big}]"), "p"));
+        assert!(!m(&format!("[data-x$='{}']", "a".repeat(100_000)), "p"));
+    }
+
+    #[test]
+    fn ci_attrs_are_sorted() {
+        assert!(CI_ATTRS.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]
@@ -1714,11 +3420,36 @@ mod tests {
              a:hover { color: red } div { unknown-prop: 1; color: var(--x) }
              @font-face { font-family: x }",
         );
-        assert_eq!(sheet.rules.len(), 4);
+        assert_eq!(sheet.rules.len(), 5);
         assert_eq!(sheet.rules[0].media.len(), 1, "@media rules are kept, with their condition");
         assert_eq!(sheet.rules[1].decls.len(), 5);
         assert!(sheet.rules[1].media.is_empty());
         assert!(sheet.rules[2].decls[0].important);
+        assert!(matches!(&sheet.rules[4].decls[..], [Declaration { decl: Decl::Var(_), .. }]));
+    }
+
+    #[test]
+    fn custom_properties_and_var_are_kept_as_text() {
+        let d = parse_declarations(
+            "--Main-Color: #ABC !important; --empty:; color: VAR(--x, red); margin: var(--a) 0;
+             --bad name: 1; unknown: var(--x); -- : x; --x: {}",
+        );
+        let raw = |n: &str, v: &str| Box::new(RawDecl { name: n.into(), value: v.into() });
+        assert_eq!(
+            d,
+            vec![
+                Declaration { decl: Decl::Custom(raw("--Main-Color", "#ABC")), important: true },
+                Declaration { decl: Decl::Custom(raw("--empty", "")), important: false },
+                Declaration { decl: Decl::Var(raw("color", "VAR(--x, red)")), important: false },
+                Declaration { decl: Decl::Var(raw("margin", "var(--a) 0")), important: false },
+            ]
+        );
+        assert_eq!(parse_substituted("margin", Some("1px 2px")).len(), 4);
+        // Invalid at computed-value time: every longhand is unset.
+        assert_eq!(parse_substituted("margin", Some("bogus")), parse_substituted("margin", None));
+        assert_eq!(parse_substituted("color", None), vec![Decl::Wide(Prop::Color, Wide::Unset)]);
+        let huge = format!("--h: {}", "x".repeat(vars::MAX_VALUE_BYTES + 1));
+        assert!(Stylesheet::parse(&format!("p {{ {huge} }}")).rules.is_empty());
     }
 
     #[test]
@@ -1761,10 +3492,11 @@ mod tests {
         let sheet = Stylesheet::parse(
             "p { color: red } @media (min-width: 600px) { p { color: blue } @media print { p { color: green } } }",
         );
-        let p = el("p", None, &[]);
+        let dom = doc("<p id=p>x</p>");
+        let tree = Tree::new(&dom);
         let count = |w: f32| {
             let mut out = Vec::new();
-            sheet.matching(&[&p], w, 0, &mut out);
+            sheet.matching(&tree, by_id(&dom, "p"), w, 0, &mut out);
             out.len()
         };
         assert_eq!(count(500.0), 1);
@@ -1774,9 +3506,9 @@ mod tests {
     #[test]
     fn matching_uses_index_and_order() {
         let sheet = Stylesheet::parse("p { color: red } .note { color: blue } #x { color: green } * { color: gray }");
-        let p = el("p", None, &["note"]);
+        let dom = doc("<p id=p class=note>x</p>");
         let mut out = Vec::new();
-        sheet.matching(&[&p], 800.0, 100, &mut out);
+        sheet.matching(&Tree::new(&dom), by_id(&dom, "p"), 800.0, 100, &mut out);
         let orders: Vec<u32> = out.iter().map(|m| m.order).collect();
         assert_eq!(orders, vec![100, 101, 103]);
     }

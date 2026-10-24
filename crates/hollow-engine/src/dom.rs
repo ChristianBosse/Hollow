@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 
 use html5ever::tendril::TendrilSink;
-use html5ever::tree_builder::TreeBuilderOpts;
+use html5ever::tree_builder::{QuirksMode, TreeBuilderOpts};
 use html5ever::{ParseOpts, driver};
 use scraper::{Html, HtmlTreeSink, Node as HtmlNode};
 use url::Url;
@@ -66,6 +66,9 @@ pub(crate) struct Node {
 #[derive(Clone, Debug)]
 pub(crate) struct Dom {
     pub nodes: Vec<Node>,
+    /// The page has no (or an ancient) doctype, so it expects the old
+    /// rendering quirks.
+    pub quirks: bool,
 }
 
 impl Dom {
@@ -190,7 +193,10 @@ pub(crate) fn parse(html: &str, base_url: &Url) -> Parsed {
     };
     let parsed: Html = driver::parse_document(HtmlTreeSink::new(Html::new_document()), opts).one(html);
 
-    let mut dom = Dom { nodes: vec![Node { parent: None, children: Vec::new(), data: NodeData::Root, url: None }] };
+    let mut dom = Dom {
+        nodes: vec![Node { parent: None, children: Vec::new(), data: NodeData::Root, url: None }],
+        quirks: parsed.quirks_mode == QuirksMode::Quirks,
+    };
     let mut base = base_url.clone();
     let mut base_seen = false;
     let mut title: Option<String> = None;

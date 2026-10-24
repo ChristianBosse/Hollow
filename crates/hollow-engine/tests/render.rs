@@ -449,3 +449,261 @@ fn oversized_stylesheets_are_rejected() {
     assert_eq!(res.insert_stylesheet(&url(0), "p{}"), Ok(()));
     assert_eq!(res.insert_stylesheet(&url(19), "p{}"), Ok(()));
 }
+
+// ---------------------------------------------------------------------------
+// Box model, flexbox, floats, positioning, clipping
+
+const RED: [u8; 4] = [255, 0, 0, 255];
+const GREEN: [u8; 4] = [0, 128, 0, 255];
+const BLUE: [u8; 4] = [0, 0, 255, 255];
+const WHITE: [u8; 4] = [255, 255, 255, 255];
+
+fn frame(html: &str, width: f32, height: f32) -> Frame {
+    layout(&format!("{PLAIN}{html}"), width).paint(0.0, height, 1.0)
+}
+
+#[test]
+fn borders_and_heights() {
+    let l = layout(
+        &format!("{PLAIN}<div style='border:5px solid red; width:50px; height:20px; background:blue'></div>"),
+        200.0,
+    );
+    assert_eq!(l.height(), 30.0, "height is the content box, borders add to it");
+    let f = l.paint(0.0, 40.0, 1.0);
+    assert_eq!(pixel(&f, 2, 2), RED);
+    assert_eq!(pixel(&f, 58, 27), RED);
+    assert_eq!(pixel(&f, 10, 10), BLUE);
+    assert_eq!(pixel(&f, 60, 10), WHITE);
+    // border-box sizing, per-side borders, and border-style none.
+    let f = frame(
+        "<div style='box-sizing:border-box; width:40px; height:40px; border-left:10px solid blue; border-top:3px none red'></div>",
+        100.0,
+        50.0,
+    );
+    assert_eq!(pixel(&f, 5, 20), BLUE);
+    assert_eq!(pixel(&f, 15, 1), WHITE, "border-style none draws nothing");
+    // min-height and max-height clamp; percentages need a definite parent.
+    assert_eq!(layout(&format!("{PLAIN}<div style='min-height:70px'>x</div>"), 200.0).height(), 70.0);
+    assert_eq!(layout(&format!("{PLAIN}<div style='height:500px; max-height:40px'></div>"), 200.0).height(), 40.0);
+    let l = layout(
+        &format!("{PLAIN}<div style='height:200px'><div style='height:25%; background:red'></div></div>"),
+        200.0,
+    );
+    let f = l.paint(0.0, 200.0, 1.0);
+    assert_eq!(pixel(&f, 10, 49), RED);
+    assert_eq!(pixel(&f, 10, 50), WHITE);
+}
+
+#[test]
+fn rounded_corners() {
+    let f = frame("<div style='width:40px; height:40px; background:#0000ff; border-radius:20px'></div>", 60.0, 50.0);
+    assert_eq!(pixel(&f, 20, 20), BLUE);
+    assert_eq!(pixel(&f, 1, 1), WHITE, "the corner is cut off");
+}
+
+#[test]
+fn calc_and_viewport_units() {
+    let f = frame("<div style='width:calc(50% - 10px); height:10px; background:red'></div>", 200.0, 20.0);
+    assert_eq!(pixel(&f, 89, 5), RED);
+    assert_eq!(pixel(&f, 90, 5), WHITE);
+    let f = frame("<div style='width:25vw; height:10px; background:red'></div>", 400.0, 20.0);
+    assert_eq!(pixel(&f, 99, 5), RED);
+    assert_eq!(pixel(&f, 100, 5), WHITE);
+}
+
+#[test]
+fn flex_row_grows_and_aligns() {
+    let item = |c: &str, extra: &str| format!("<div style='flex:1; height:20px; background:{c}; {extra}'></div>");
+    let html = format!(
+        "<div style='display:flex; width:300px'>{}{}{}</div>",
+        item("red", ""),
+        item("green", "flex-grow:2"),
+        item("blue", "")
+    );
+    let f = frame(&html, 400.0, 30.0);
+    assert_eq!(pixel(&f, 74, 10), RED);
+    assert_eq!(pixel(&f, 76, 10), GREEN);
+    assert_eq!(pixel(&f, 224, 10), GREEN);
+    assert_eq!(pixel(&f, 226, 10), BLUE);
+    assert_eq!(pixel(&f, 301, 10), WHITE);
+
+    // justify-content and align-items; the container is as tall as its tallest item.
+    let html = "<div style='display:flex; justify-content:space-between; align-items:center; width:200px'>\
+                <div style='width:20px; height:60px; background:red'></div>\
+                <div style='width:20px; height:20px; background:blue'></div></div>";
+    let l = layout(&format!("{PLAIN}{html}"), 400.0);
+    assert_eq!(l.height(), 60.0);
+    let f = l.paint(0.0, 60.0, 1.0);
+    assert_eq!(pixel(&f, 190, 30), BLUE, "pushed to the end and centered");
+    assert_eq!(pixel(&f, 190, 15), WHITE);
+    // Stretch is the default: an item without a height fills the line.
+    let html = "<div style='display:flex'><div style='height:50px; width:10px'></div>\
+                <div style='background:red; width:10px'></div></div>";
+    assert_eq!(pixel(&frame(html, 100.0, 60.0), 15, 45), RED);
+}
+
+#[test]
+fn flex_wraps_and_columns() {
+    let item = "<div style='width:60px; height:10px; background:red; margin-right:10px'></div>";
+    let l = layout(
+        &format!("{PLAIN}<div style='display:flex; flex-wrap:wrap; width:150px'>{}</div>", item.repeat(4)),
+        300.0,
+    );
+    assert_eq!(l.height(), 20.0, "two per line");
+    let col = "<div style='display:flex; flex-direction:column; height:100px'>\
+               <div style='height:10px; background:red'></div>\
+               <div style='flex-grow:1; background:blue'></div></div>";
+    let f = frame(col, 100.0, 120.0);
+    assert_eq!(pixel(&f, 50, 5), RED);
+    assert_eq!(pixel(&f, 50, 99), BLUE, "the second item fills the rest");
+    assert_eq!(pixel(&f, 50, 101), WHITE);
+    let html = "<div style='display:flex; flex-direction:row-reverse; width:200px'>\
+                <div style='width:50px; height:10px; background:red'></div>\
+                <div style='width:50px; height:10px; background:blue'></div></div>";
+    let f = frame(html, 300.0, 20.0);
+    assert_eq!(pixel(&f, 175, 5), RED);
+    assert_eq!(pixel(&f, 125, 5), BLUE);
+    // Text directly inside a flex container becomes an item of its own.
+    let l = layout(&format!("{PLAIN}<div style='display:flex'>loose text<b>bold</b></div>"), 300.0);
+    assert!(l.height() > 10.0 && l.height() < 30.0, "one line: {}", l.height());
+}
+
+#[test]
+fn floats_and_clear() {
+    let html = "<div style='float:left; width:100px; height:50px; background:red'></div>\
+                <p style='margin:0'>Text flows beside the float</p>\
+                <div style='clear:both; height:10px; background:blue'></div>";
+    let f = frame(html, 400.0, 80.0);
+    assert_eq!(pixel(&f, 50, 25), RED);
+    assert!(ink(&f, 100, 0, 400, 20) > 30, "text starts right of the float");
+    assert_eq!(pixel(&f, 50, 55), BLUE, "the cleared block starts below the float");
+    let f = frame(
+        "<div style='float:right; width:50px; height:20px; background:blue'></div>\
+         <div style='float:right; width:50px; height:20px; background:red'></div>",
+        200.0,
+        30.0,
+    );
+    assert_eq!(pixel(&f, 175, 10), BLUE);
+    assert_eq!(pixel(&f, 125, 10), RED, "right floats stack leftwards");
+    // A formatting context root sits beside a float instead of under it.
+    let f = frame(
+        "<div style='float:left; width:50px; height:20px; background:red'></div>\
+         <div style='overflow:hidden; height:20px; background:blue'></div>",
+        200.0,
+        30.0,
+    );
+    assert_eq!(pixel(&f, 25, 10), RED);
+    assert_eq!(pixel(&f, 100, 10), BLUE);
+    // A container that is its own formatting context grows to hold its floats.
+    let html = "<div style='display:flow-root'><div style='float:left; height:40px; width:5px'></div></div>";
+    assert_eq!(layout(&format!("{PLAIN}{html}"), 100.0).height(), 40.0);
+}
+
+#[test]
+fn absolute_and_relative_positioning() {
+    let html = "<div style='position:relative; width:200px; height:100px; margin-left:50px'>\
+                <div style='position:absolute; top:10px; left:20px; width:30px; height:30px; background:red'></div>\
+                <div style='position:absolute; right:0; bottom:0; width:10px; height:10px; background:blue'></div>\
+                </div><p style='margin:0'>after</p>";
+    let f = frame(html, 400.0, 130.0);
+    assert_eq!(pixel(&f, 75, 15), RED);
+    assert_eq!(pixel(&f, 69, 15), WHITE);
+    assert_eq!(pixel(&f, 245, 95), BLUE);
+    assert!(ink(&f, 0, 100, 100, 125) > 10, "absolute boxes take no room in the flow");
+    let f = frame(
+        "<div style='position:relative; left:30px; top:5px; width:10px; height:10px; background:red'></div>",
+        100.0,
+        20.0,
+    );
+    assert_eq!(pixel(&f, 35, 10), RED);
+    assert_eq!(pixel(&f, 5, 2), WHITE);
+    // Without offsets it stays where it would have been in flow.
+    let f = frame(
+        "<div style='height:30px'></div><div style='position:absolute; width:10px; height:10px; background:red'></div>",
+        100.0,
+        50.0,
+    );
+    assert_eq!(pixel(&f, 5, 35), RED);
+    // left/right with auto margins centers.
+    let f = frame(
+        "<div style='position:absolute; left:0; right:0; margin:auto; width:20px; height:10px; background:red'></div>",
+        100.0,
+        20.0,
+    );
+    assert_eq!(pixel(&f, 50, 5), RED);
+    assert_eq!(pixel(&f, 35, 5), WHITE);
+}
+
+#[test]
+fn z_index_orders_painting() {
+    let html = "<div style='position:relative'>\
+                <div style='position:absolute; z-index:2; width:20px; height:20px; background:red'></div>\
+                <div style='position:absolute; z-index:1; width:20px; height:20px; background:blue'></div></div>";
+    assert_eq!(pixel(&frame(html, 100.0, 30.0), 10, 10), RED, "higher z-index paints on top");
+}
+
+#[test]
+fn overflow_hidden_clips() {
+    let html = "<div style='height:20px; overflow:hidden'><div style='height:100px; background:red'></div></div>";
+    let f = frame(html, 100.0, 120.0);
+    assert_eq!(pixel(&f, 50, 10), RED);
+    assert_eq!(pixel(&f, 50, 30), WHITE, "clipped below the box");
+    // A one-pixel "screen reader only" box shows nothing.
+    let sr = "<p style='margin:0'>visible</p><span style='position:absolute; width:1px; height:1px; \
+              overflow:hidden'>hidden screen reader text</span>";
+    let f = frame(sr, 300.0, 60.0);
+    assert_eq!(ink(&f, 0, 25, 300, 60), 0);
+}
+
+#[test]
+fn inline_blocks_sit_on_the_line() {
+    let html = "<div><span style='display:inline-block; width:40px; height:30px; background:red'></span> \
+                <span style='display:inline-block; width:40px; height:30px; background:blue'></span></div>";
+    let f = frame(html, 300.0, 50.0);
+    assert_eq!(pixel(&f, 20, 15), RED);
+    let blue_x = (0..300).find(|&x| pixel(&f, x, 15) == BLUE).expect("blue box");
+    assert!((44..=50).contains(&blue_x), "a space apart: {blue_x}");
+    // A block-level image without its resource keeps its explicit size.
+    let l = layout(&format!("{PLAIN}<img src=/x.png style='display:block' width=40 height=30>"), 200.0);
+    assert_eq!(l.height(), 30.0);
+}
+
+#[test]
+fn nowrap_items_still_break_between_them() {
+    let items = "<span style='white-space:nowrap'>one item</span> ".repeat(30);
+    let l = layout(&format!("{PLAIN}<p style='margin:0'>{items}</p>"), 200.0);
+    let f = l.paint(0.0, l.height(), 1.0);
+    assert!(l.height() > 60.0, "wrapped onto several lines");
+    assert_eq!(ink(&f, 200, 0, f.width, f.height), 0);
+}
+
+#[test]
+fn hostile_layout_inputs() {
+    let inputs: Vec<String> = vec![
+        "<div style='display:flex'>".repeat(3_000) + "x",
+        "<div style='float:left'>f</div>".repeat(5_000),
+        "<div style='position:absolute'>".repeat(3_000) + "x",
+        "<div style='position:relative'><span style='position:absolute'>a</span>".repeat(2_000),
+        "<span style='display:inline-block'>".repeat(3_000) + "x",
+        "<div style='display:flex;flex-wrap:wrap'>".to_string()
+            + &"<div style='flex:1 1 1e9px;min-width:1e9px'></div>".repeat(2_000),
+        "<div style='overflow:hidden;height:1px'>".repeat(2_000) + "x",
+        "<div style='width:calc(100% - 1e30px);height:calc(1e30px * 1e30);margin:clamp(1px,1e40px,2px)'>x</div>"
+            .to_string(),
+        "<div style='display:flex;flex-direction:column;height:10px'>".to_string()
+            + &"<p style='flex:1'>x</p>".repeat(5_000),
+        "<div style='float:right;width:1e9px;clear:both'>x</div><p>y</p>".repeat(500),
+    ];
+    let handle = std::thread::Builder::new()
+        .stack_size(1 << 20)
+        .spawn(move || {
+            for html in &inputs {
+                let l = layout(html, 800.0);
+                assert!(l.height().is_finite() && l.height() >= 0.0);
+                let f = l.paint(0.0, 600.0, 1.0);
+                assert_eq!(f.rgba.len(), (f.width * f.height * 4) as usize);
+            }
+        })
+        .unwrap();
+    handle.join().expect("hostile layout input panicked or overflowed the stack");
+}

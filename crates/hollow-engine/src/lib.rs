@@ -27,6 +27,7 @@ mod layout;
 mod paint;
 mod style;
 mod text;
+mod vars;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};

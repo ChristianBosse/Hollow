@@ -8,11 +8,12 @@
 use std::collections::BTreeMap;
 
 use tiny_skia::{
-    FillRule, FilterQuality, Paint, PathBuilder, PathSegment, Pixmap, PixmapPaint, Rect as SkRect, Transform,
+    FillRule, FilterQuality, IntSize, Mask, Paint, PathBuilder, PathSegment, Pixmap, PixmapPaint, Rect as SkRect,
+    Stroke, Transform,
 };
 
 use crate::css::Color;
-use crate::layout::{DisplayItem, Laid};
+use crate::layout::{DisplayItem, Laid, Rect};
 use crate::text::{self, FaceId};
 
 /// Largest frame we will allocate: 64 Mpx (256 MiB of RGBA).
@@ -77,33 +78,118 @@ pub(crate) fn paint(laid: &Laid, paths: &GlyphPaths, scroll_y: f32, height: f32,
     let c = laid.canvas;
     pixmap.fill(tiny_skia::Color::from_rgba8(c.r, c.g, c.b, 255));
     let view_bottom = scroll_y + h as f32 / scale;
+    let device = |r: &Rect| -> [f32; 4] {
+        [
+            (r.x * scale).round(),
+            ((r.y - scroll_y) * scale).round(),
+            ((r.x + r.w) * scale).round(),
+            ((r.y + r.h - scroll_y) * scale).round(),
+        ]
+    };
+    // Masks for clips that cut through glyphs or images, made on first use.
+    let mut masks: BTreeMap<u32, Mask> = BTreeMap::new();
 
-    for it in &laid.items {
+    for (i, it) in laid.items.iter().enumerate() {
         let (top, bottom) = it.y_range();
         if bottom < scroll_y || top > view_bottom {
             continue;
         }
+        let clip_id = laid.clips.get(i).copied().unwrap_or(0);
+        let clip = laid.clip_rects.get(clip_id as usize).filter(|_| clip_id != 0).map(device);
+        if let Some([cx0, cy0, cx1, cy1]) = clip
+            && (cx1 <= cx0 || cy1 <= cy0 || cy1 <= 0.0 || cy0 >= h as f32)
+        {
+            continue;
+        }
+        // For a device-space box: None if clipped away entirely, else
+        // whether it needs the mask.
+        let coverage = |b: [f32; 4]| -> Option<bool> {
+            match clip {
+                None => Some(false),
+                Some(c) if b[2] <= c[0] || b[0] >= c[2] || b[3] <= c[1] || b[1] >= c[3] => None,
+                Some(c) => Some(b[0] < c[0] || b[1] < c[1] || b[2] > c[2] || b[3] > c[3]),
+            }
+        };
+        let make_mask = |masks: &mut BTreeMap<u32, Mask>| -> bool {
+            if !masks.contains_key(&clip_id)
+                && let Some(m) = clip.and_then(|c| rect_mask(w, h, c))
+            {
+                masks.insert(clip_id, m);
+            }
+            masks.contains_key(&clip_id)
+        };
         match it {
             DisplayItem::Rect { rect, color } => {
                 if color.a == 0 || rect.w <= 0.0 || rect.h <= 0.0 {
                     continue;
                 }
                 // Snap to device pixels; keep hairlines at least one pixel.
-                let x0 = (rect.x * scale).round();
-                let y0 = ((rect.y - scroll_y) * scale).round();
-                let x1 = ((rect.x + rect.w) * scale).round().max(x0 + 1.0);
-                let y1 = (((rect.y + rect.h) - scroll_y) * scale).round().max(y0 + 1.0);
+                let mut x0 = (rect.x * scale).round();
+                let mut y0 = ((rect.y - scroll_y) * scale).round();
+                let mut x1 = ((rect.x + rect.w) * scale).round().max(x0 + 1.0);
+                let mut y1 = (((rect.y + rect.h) - scroll_y) * scale).round().max(y0 + 1.0);
+                if let Some([cx0, cy0, cx1, cy1]) = clip {
+                    x0 = x0.max(cx0);
+                    y0 = y0.max(cy0);
+                    x1 = x1.min(cx1);
+                    y1 = y1.min(cy1);
+                    if x1 <= x0 || y1 <= y0 {
+                        continue;
+                    }
+                }
                 if let Some(r) = SkRect::from_ltrb(x0, y0, x1, y1) {
                     let mut p = paint_for(*color);
                     p.anti_alias = false;
                     pixmap.fill_rect(r, &p, Transform::identity(), None);
                 }
             }
+            DisplayItem::Round { rect, radius, stroke, color } => {
+                if color.a == 0 || rect.w <= 0.0 || rect.h <= 0.0 {
+                    continue;
+                }
+                let b = device(rect);
+                let Some(masked) = coverage(b) else { continue };
+                if masked && !make_mask(&mut masks) {
+                    continue;
+                }
+                let mask = if masked { masks.get(&clip_id) } else { None };
+                let inset = if *stroke > 0.0 { stroke * scale / 2.0 } else { 0.0 };
+                let r = (radius * scale - inset).max(0.0);
+                let Some(path) = rounded_rect(b[0] + inset, b[1] + inset, b[2] - inset, b[3] - inset, r) else {
+                    continue;
+                };
+                let p = paint_for(*color);
+                if *stroke > 0.0 {
+                    let s = Stroke { width: stroke * scale, ..Stroke::default() };
+                    pixmap.stroke_path(&path, &p, &s, Transform::identity(), mask);
+                } else {
+                    pixmap.fill_path(&path, &p, FillRule::Winding, Transform::identity(), mask);
+                }
+            }
             DisplayItem::Text { face, size, color, x, y, glyphs } => {
                 let Some(f) = text::face(*face) else { continue };
                 let k = f.scale(*size);
+                let run = laid.glyphs.get(glyphs.start as usize..glyphs.end as usize).unwrap_or(&[]);
+                let mut mask = None;
+                if clip.is_some() {
+                    let (gx0, gx1) =
+                        run.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), g| (a.min(g.x), b.max(g.x)));
+                    let b = [
+                        (x + gx0.min(0.0)) * scale,
+                        (top - scroll_y) * scale,
+                        (x + gx1.max(0.0) + size) * scale,
+                        (bottom - scroll_y) * scale,
+                    ];
+                    let Some(masked) = coverage(b) else { continue };
+                    if masked {
+                        if !make_mask(&mut masks) {
+                            continue;
+                        }
+                        mask = masks.get(&clip_id);
+                    }
+                }
                 let mut pb = PathBuilder::new();
-                for g in laid.glyphs.get(glyphs.start as usize..glyphs.end as usize).unwrap_or(&[]) {
+                for g in run {
                     let Some(path) = paths.get(&(*face, g.id)) else { continue };
                     let ox = (x + g.x) * scale;
                     let oy = (y + g.y - scroll_y) * scale;
@@ -133,7 +219,7 @@ pub(crate) fn paint(laid: &Laid, paths: &GlyphPaths, scroll_y: f32, height: f32,
                     }
                 }
                 if let Some(path) = pb.finish() {
-                    pixmap.fill_path(&path, &paint_for(*color), FillRule::Winding, Transform::identity(), None);
+                    pixmap.fill_path(&path, &paint_for(*color), FillRule::Winding, Transform::identity(), mask);
                 }
             }
             DisplayItem::Image { rect, image } => {
@@ -141,13 +227,53 @@ pub(crate) fn paint(laid: &Laid, paths: &GlyphPaths, scroll_y: f32, height: f32,
                 if rect.w <= 0.0 || rect.h <= 0.0 {
                     continue;
                 }
+                let Some(masked) = coverage(device(rect)) else { continue };
+                if masked && !make_mask(&mut masks) {
+                    continue;
+                }
+                let mask = if masked { masks.get(&clip_id) } else { None };
                 let sx = rect.w * scale / img.width() as f32;
                 let sy = rect.h * scale / img.height() as f32;
                 let ts = Transform::from_row(sx, 0.0, 0.0, sy, rect.x * scale, (rect.y - scroll_y) * scale);
                 let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..PixmapPaint::default() };
-                pixmap.draw_pixmap(0, 0, (**img).as_ref(), &paint, ts, None);
+                pixmap.draw_pixmap(0, 0, (**img).as_ref(), &paint, ts, mask);
             }
         }
     }
     (w, h, pixmap.take())
+}
+
+/// A frame-sized mask that is opaque inside the device rectangle `c`.
+fn rect_mask(w: u32, h: u32, c: [f32; 4]) -> Option<Mask> {
+    let clampi = |v: f32, max: u32| if v.is_finite() { v.clamp(0.0, max as f32) as usize } else { 0 };
+    let (x0, x1) = (clampi(c[0], w), clampi(c[2], w));
+    let (y0, y1) = (clampi(c[1], h), clampi(c[3], h));
+    let mut data = vec![0u8; (w as usize) * (h as usize)];
+    for row in y0..y1 {
+        let start = row * w as usize;
+        data[start + x0..start + x1.max(x0)].fill(255);
+    }
+    Mask::from_vec(data, IntSize::from_wh(w, h)?)
+}
+
+/// A rectangle with circular corners of radius `r`, in device pixels.
+fn rounded_rect(x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> Option<tiny_skia::Path> {
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let r = r.min((x1 - x0) / 2.0).min((y1 - y0) / 2.0).max(0.0);
+    // Cubic approximation of a quarter circle.
+    let k = r * 0.552_284_8;
+    let mut pb = PathBuilder::new();
+    pb.move_to(x0 + r, y0);
+    pb.line_to(x1 - r, y0);
+    pb.cubic_to(x1 - r + k, y0, x1, y0 + r - k, x1, y0 + r);
+    pb.line_to(x1, y1 - r);
+    pb.cubic_to(x1, y1 - r + k, x1 - r + k, y1, x1 - r, y1);
+    pb.line_to(x0 + r, y1);
+    pb.cubic_to(x0 + r - k, y1, x0, y1 - r + k, x0, y1 - r);
+    pb.line_to(x0, y0 + r);
+    pb.cubic_to(x0, y0 + r - k, x0 + r - k, y0, x0 + r, y0);
+    pb.close();
+    pb.finish()
 }
