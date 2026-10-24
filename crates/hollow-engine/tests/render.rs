@@ -1002,3 +1002,64 @@ fn hostile_generated_content_tables_and_backgrounds() {
         .unwrap();
     handle.join().expect("hostile input panicked or overflowed the stack");
 }
+
+#[test]
+fn forms_are_clicked_typed_drawn_and_submitted() {
+    use hollow_engine::{FormKey, FormMethod, Interaction};
+    let html = format!(
+        "{PLAIN}<form action='/find' method=post>\
+         <input name=q placeholder='Search' style='display:block;width:200px;height:24px;margin:0'>\
+         <input type=checkbox name=c style='display:block;width:16px;height:16px;margin:0'>\
+         <select name=s style='display:block;margin:0'><option>first<option>second</select>\
+         <button style='display:block;margin:0'>Go</button></form>"
+    );
+    let doc = Document::parse(&html, &base());
+    let l = Layout::new(&doc, &Resources::new(), 400.0);
+    let mut forms = doc.forms();
+    // Placeholder text is drawn, gray, before anything is typed.
+    let before = l.paint_forms(&forms, 0.0, 120.0, 1.0);
+    assert!(ink(&before, 4, 4, 100, 22) > 20, "placeholder");
+
+    let field = l.hit_test_forms(&forms, 50.0, 12.0);
+    assert!(matches!(field, Some(HitTarget::Control(_))), "the text field is a control: {field:?}");
+    assert_eq!(forms.click(&doc, field.as_ref()), Interaction::Repaint);
+    assert!(forms.editing());
+    forms.key(&doc, &FormKey::Text("WWWWWW".into()));
+    let typed = l.paint_forms(&forms, 0.0, 120.0, 1.0);
+    assert_ne!(typed, before, "typing changes the field");
+    // The same layout painted without state still shows the page's own values.
+    assert_eq!(l.paint(0.0, 120.0, 1.0), before);
+
+    // Tick the checkbox: its inside fills in.
+    let check = l.hit_test_forms(&forms, 8.0, 32.0);
+    forms.click(&doc, check.as_ref());
+    let ticked = l.paint_forms(&forms, 0.0, 120.0, 1.0);
+    assert!(ink(&ticked, 4, 28, 12, 36) > ink(&typed, 4, 28, 12, 36));
+
+    // Open the select, pick the second option from the floating list.
+    let select = l.hit_test_forms(&forms, 10.0, 50.0);
+    forms.click(&doc, select.as_ref());
+    let open = l.paint_forms(&forms, 0.0, 120.0, 1.0);
+    assert!(ink(&open, 0, 70, 120, 110) > ink(&ticked, 0, 70, 120, 110), "the list is drawn below the select");
+    let mut picked = None;
+    for y in 60..120 {
+        if let Some(HitTarget::Option(_, 1)) = l.hit_test_forms(&forms, 10.0, y as f32) {
+            picked = l.hit_test_forms(&forms, 10.0, y as f32);
+            break;
+        }
+    }
+    assert!(picked.is_some(), "the second option can be hit");
+    forms.click(&doc, picked.as_ref());
+
+    // Enter in the text field submits with every entry.
+    forms.click(&doc, field.as_ref());
+    match forms.key(&doc, &FormKey::Enter) {
+        Interaction::Submit(s) => {
+            assert_eq!(s.action.as_str(), "https://example.org/find");
+            assert_eq!(s.method, FormMethod::Post);
+            let pairs: Vec<(&str, &str)> = s.entries.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+            assert_eq!(pairs, [("q", "WWWWWW"), ("c", "on"), ("s", "second")]);
+        }
+        other => panic!("expected a submission, got {other:?}"),
+    }
+}

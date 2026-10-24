@@ -119,6 +119,8 @@ enum Item {
         w: f32,
         h: f32,
         style: NodeId,
+        kind: FieldKind,
+        link: Option<u32>,
     },
     Break {
         style: NodeId,
@@ -149,7 +151,7 @@ impl Item {
     }
     fn link(&self) -> Option<u32> {
         match self {
-            Item::Text { link, .. } | Item::Image { link, .. } => *link,
+            Item::Text { link, .. } | Item::Image { link, .. } | Item::Field { link, .. } => *link,
             _ => None,
         }
     }
@@ -263,7 +265,7 @@ struct Builder<'a> {
     generated: &'a Generated,
     resources: &'a Resources,
     boxes: Vec<LBox>,
-    links: Vec<Url>,
+    links: Vec<LinkTarget>,
     link_ids: BTreeMap<NodeId, u32>,
     images: Vec<Arc<Pixmap>>,
     image_ids: BTreeMap<String, u32>,
@@ -506,6 +508,8 @@ impl<'a> Builder<'a> {
     fn link_of(&mut self, node: NodeId, el: Option<&Element>, link: Option<u32>) -> Option<u32> {
         match (el, self.dom.nodes.get(node).and_then(|n| n.url.as_ref())) {
             (Some(el), Some(url)) if matches!(el.name.as_str(), "a" | "area") => Some(self.link_id(node, url)),
+            // Controls inside a link are the control, as in browsers.
+            (Some(el), _) if is_control(el) => Some(self.control_id(node)),
             _ => link,
         }
     }
@@ -772,57 +776,68 @@ impl<'a> Builder<'a> {
                     }
                     "checkbox" | "radio" => {
                         self.last_space = false;
-                        items.push(Item::Field { w: 13.0, h: 13.0, style: node });
+                        let kind = if ty == "radio" { FieldKind::Radio } else { FieldKind::Check };
+                        items.push(Item::Field { w: 13.0, h: 13.0, style: node, kind, link: ctx.link });
                     }
                     "hidden" | "image" | "file" | "range" | "color" => {}
                     _ => {
                         self.last_space = false;
-                        let h = (st.font_size * 1.25).max(1.0);
-                        items.push(Item::Field { w: FIELD_WIDTH, h, style: node });
+                        let h = (st.font_size * 1.25).max(1.0) + 4.0;
+                        items.push(Item::Field {
+                            w: FIELD_WIDTH,
+                            h,
+                            style: node,
+                            kind: FieldKind::Text,
+                            link: ctx.link,
+                        });
                     }
                 }
             }
             "textarea" => {
                 self.last_space = false;
-                items.push(Item::Field { w: FIELD_WIDTH * 1.4, h: st.font_size * 2.5, style: node });
+                let rows = el.attr("rows").and_then(|r| r.trim().parse::<f32>().ok()).unwrap_or(2.0).clamp(1.0, 100.0);
+                let cols = el.attr("cols").and_then(|c| c.trim().parse::<f32>().ok()).unwrap_or(20.0).clamp(1.0, 500.0);
+                let (w, h) = (cols * st.font_size * 0.55 + 6.0, rows * st.font_size * 1.2 + 6.0);
+                items.push(Item::Field { w, h, style: node, kind: FieldKind::Area, link: ctx.link });
             }
             "select" => {
-                let label = self.first_option_text(node);
-                items.push(text_item(self, &format!("{label} \u{25BE}"), Some(Color::rgb(0xe9, 0xe9, 0xed))));
+                self.last_space = false;
+                // Wide enough for the longest option, as browsers size it.
+                let w = (self.widest_option(node) as f32 * st.font_size * 0.55 + 28.0).clamp(40.0, 480.0);
+                // `multiple` or `size` > 1 is a list box showing several rows.
+                let size = el.attr("size").and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
+                let rows = if el.attr("multiple").is_some() { if size == 0 { 4 } else { size } } else { size };
+                let (h, kind) = if rows > 1 {
+                    ((rows.min(100) as f32 * st.font_size * 1.2) + 4.0, FieldKind::List)
+                } else {
+                    ((st.font_size * 1.25).max(1.0) + 4.0, FieldKind::Select)
+                };
+                items.push(Item::Field { w, h, style: node, kind, link: ctx.link });
             }
             _ => {}
         }
     }
 
-    fn first_option_text(&self, select: NodeId) -> String {
+    /// Characters in the longest option label of a `<select>`.
+    fn widest_option(&self, select: NodeId) -> usize {
         let dom = self.dom;
-        let mut first = None;
-        let mut stack = vec![select];
-        while let Some(n) = stack.pop() {
-            for &c in dom.nodes[n].children.iter().rev() {
-                if let Some(e) = dom.element(c) {
-                    if e.name == "option" {
-                        let text: String = dom.nodes[c]
-                            .children
-                            .iter()
-                            .filter_map(|&t| match &dom.nodes[t].data {
-                                NodeData::Text(s) => Some(s.as_str()),
-                                _ => None,
-                            })
-                            .collect();
-                        let text = crate::dom::collapse_whitespace(&text);
-                        if e.attr("selected").is_some() {
-                            return text;
-                        }
-                        // Children are visited in reverse, so keep overwriting.
-                        first = Some(text);
-                    } else if e.name == "optgroup" {
-                        stack.push(c);
-                    }
+        let inside =
+            |n: NodeId| std::iter::successors(dom.nodes[n].parent, |&p| dom.nodes[p].parent).any(|a| a == select);
+        let mut widest = 0;
+        let mut current = 0;
+        for n in (select + 1..dom.nodes.len()).take_while(|&n| inside(n)).take(20_000) {
+            match &dom.nodes[n].data {
+                crate::dom::NodeData::Element(e) if e.name == "option" => {
+                    widest = widest.max(current);
+                    current = 0;
                 }
+                crate::dom::NodeData::Text(t) => {
+                    current += t.split_whitespace().map(|w| w.chars().count() + 1).sum::<usize>()
+                }
+                _ => {}
             }
         }
-        first.unwrap_or_default()
+        widest.max(current)
     }
 
     fn link_id(&mut self, node: NodeId, url: &Url) -> u32 {
@@ -830,7 +845,18 @@ impl<'a> Builder<'a> {
             return id;
         }
         let id = self.links.len() as u32;
-        self.links.push(url.clone());
+        self.links.push(LinkTarget::Url(url.clone()));
+        self.link_ids.insert(node, id);
+        id
+    }
+
+    /// A clickable form control (or `<label>`), hit-tested like a link.
+    fn control_id(&mut self, node: NodeId) -> u32 {
+        if let Some(&id) = self.link_ids.get(&node) {
+            return id;
+        }
+        let id = self.links.len() as u32;
+        self.links.push(LinkTarget::Control(node));
         self.link_ids.insert(node, id);
         id
     }
@@ -994,6 +1020,16 @@ pub(crate) enum DisplayItem {
         rect: Rect,
         image: u32,
     },
+    /// Where a form control sits; [`crate::fields`] draws its current value
+    /// here at paint time. Paints nothing by itself.
+    Field {
+        rect: Rect,
+        node: NodeId,
+        kind: FieldKind,
+        face: FaceId,
+        size: f32,
+        color: Color,
+    },
     /// A filled quadrilateral, corners in order: a border side that meets
     /// its neighbours on the diagonal.
     Quad {
@@ -1017,9 +1053,10 @@ pub(crate) enum DisplayItem {
 impl DisplayItem {
     fn shift(&mut self, dx: f32, dy: f32) {
         match self {
-            DisplayItem::Rect { rect, .. } | DisplayItem::Round { rect, .. } | DisplayItem::Image { rect, .. } => {
-                *rect = rect.shifted(dx, dy)
-            }
+            DisplayItem::Rect { rect, .. }
+            | DisplayItem::Round { rect, .. }
+            | DisplayItem::Image { rect, .. }
+            | DisplayItem::Field { rect, .. } => *rect = rect.shifted(dx, dy),
             DisplayItem::Text { x, y, .. } => {
                 *x += dx;
                 *y += dy;
@@ -1044,6 +1081,7 @@ impl DisplayItem {
             DisplayItem::Rect { rect, .. }
             | DisplayItem::Round { rect, .. }
             | DisplayItem::Image { rect, .. }
+            | DisplayItem::Field { rect, .. }
             | DisplayItem::Background { area: rect, .. } => (rect.y, rect.y + rect.h),
             DisplayItem::Text { y, size, .. } => (y - size * 1.3, y + size * 0.6),
             DisplayItem::Quad { points, .. } => {
@@ -1065,8 +1103,37 @@ pub(crate) struct Laid {
     pub clip_rects: Vec<Rect>,
     pub glyphs: Vec<PlacedGlyph>,
     pub links: Vec<(Rect, u32)>,
-    pub link_urls: Vec<Url>,
+    pub link_targets: Vec<LinkTarget>,
     pub images: Vec<Arc<Pixmap>>,
+    /// The forms as the page wrote them, for painting without user state.
+    pub forms: crate::form::Forms,
+}
+
+/// What a link region leads to.
+#[derive(Clone, Debug)]
+pub(crate) enum LinkTarget {
+    Url(Url),
+    Control(NodeId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FieldKind {
+    Text,
+    Area,
+    Check,
+    Radio,
+    Select,
+    /// A `<select>` showing several rows at once.
+    List,
+}
+
+/// Elements that are clicked as form controls.
+fn is_control(el: &Element) -> bool {
+    match el.name.as_str() {
+        "button" | "select" | "textarea" | "label" => true,
+        "input" => !el.attr("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("hidden")),
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1355,7 +1422,7 @@ pub(crate) fn layout(dom: &Dom, styles: &Styles, generated: &Generated, resource
     b.flush(0, &mut roots, &mut items);
 
     let (canvas, canvas_node) = canvas_color(dom, styles);
-    let Builder { boxes, links: link_urls, images, image_ids, .. } = b;
+    let Builder { boxes, links: link_targets, images, image_ids, .. } = b;
     let mut ctx = Ctx {
         boxes: &boxes,
         styles,
@@ -1441,8 +1508,9 @@ pub(crate) fn layout(dom: &Dom, styles: &Styles, generated: &Generated, resource
         clip_rects: resolved,
         glyphs,
         links,
-        link_urls,
+        link_targets,
         images: images.clone(),
+        forms: crate::form::Forms::new(dom),
     }
 }
 
@@ -2059,9 +2127,17 @@ impl Ctx<'_> {
             }
             Kind::Replaced(item) => {
                 let top = inner.place();
-                let (iw, ih) = self.replaced_size(item, w, definite);
+                let (mut iw, ih) = self.replaced_size(item, w, definite);
+                // A control takes the width its box was given (stretched by
+                // flex, say); an image keeps its own.
+                if matches!(item, Item::Field { .. }) {
+                    iw = w;
+                }
                 if st.visible {
                     let rect = Rect { x, y: top, w: iw, h: ih };
+                    if let Some(link) = item.link() {
+                        self.links.push((rect, link));
+                    }
                     self.draw_object(item, rect, None);
                 }
                 inner.y = top + ih;
@@ -2092,11 +2168,16 @@ impl Ctx<'_> {
                 }
                 s.resolve(avail)
             }
-            Item::Field { w, h, style } => {
+            Item::Field { w, h, style, .. } => {
                 let st = &self.styles[*style];
                 let fits = st.width.is_definite() && (avail.is_finite() || !st.width.has_pct());
                 let w = if fits { st.width.resolve(avail) } else { *w };
-                (clamp_extent(w), height.unwrap_or(*h))
+                let h = match height {
+                    Some(h) => h,
+                    None if matches!(st.height, Len::Px(_)) => st.height.resolve(0.0),
+                    None => *h,
+                };
+                (clamp_extent(w), clamp_extent(h))
             }
             _ => (0.0, 0.0),
         }
@@ -2106,13 +2187,27 @@ impl Ctx<'_> {
     fn draw_object(&mut self, item: &Item, rect: Rect, _st: Option<&Style>) {
         match item {
             Item::Image { image: Some(img), .. } => self.push(DisplayItem::Image { rect, image: *img }),
-            Item::Field { .. } => {
+            Item::Field { kind, style, .. } => {
+                let st = &self.styles[*style];
                 let border = Color::rgb(0x76, 0x76, 0x76);
-                self.push(DisplayItem::Rect { rect, color: border });
-                if rect.w > 2.0 && rect.h > 2.0 {
-                    let inner = Rect { x: rect.x + 1.0, y: rect.y + 1.0, w: rect.w - 2.0, h: rect.h - 2.0 };
-                    self.push(DisplayItem::Rect { rect: inner, color: Color::WHITE });
+                let fill = if *kind == FieldKind::Select { Color::rgb(0xe9, 0xe9, 0xed) } else { Color::WHITE };
+                let inner = Rect { x: rect.x + 1.0, y: rect.y + 1.0, w: rect.w - 2.0, h: rect.h - 2.0 };
+                if *kind == FieldKind::Radio {
+                    let r = rect.w.min(rect.h) / 2.0;
+                    self.push(DisplayItem::Round { rect, radius: r, stroke: 0.0, color: border });
+                    if inner.w > 0.0 && inner.h > 0.0 {
+                        self.push(DisplayItem::Round { rect: inner, radius: r - 1.0, stroke: 0.0, color: fill });
+                    }
+                } else {
+                    self.push(DisplayItem::Rect { rect, color: border });
+                    if inner.w > 0.0 && inner.h > 0.0 {
+                        self.push(DisplayItem::Rect { rect: inner, color: fill });
+                    }
                 }
+                // Values, carets and check marks are drawn at paint time
+                // from the form state (see `fields`).
+                let (face, size, color) = (face_of(st), st.font_size, st.color);
+                self.push(DisplayItem::Field { rect, node: *style, kind: *kind, face, size, color });
             }
             _ => {}
         }

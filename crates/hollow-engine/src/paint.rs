@@ -70,7 +70,15 @@ fn ceil_px(v: f32) -> u32 {
 }
 
 /// Returns (width, height, premultiplied RGBA).
-pub(crate) fn paint(laid: &Laid, paths: &GlyphPaths, scroll_y: f32, height: f32, scale: f32) -> (u32, u32, Vec<u8>) {
+/// `extra` holds outlines of glyphs added after layout (form field values).
+pub(crate) fn paint(
+    laid: &Laid,
+    paths: &GlyphPaths,
+    extra: &GlyphPaths,
+    scroll_y: f32,
+    height: f32,
+    scale: f32,
+) -> (u32, u32, Vec<u8>) {
     let scale = if scale.is_finite() && scale > 0.0 { scale.clamp(0.1, 8.0) } else { 1.0 };
     let scroll_y = if scroll_y.is_finite() { scroll_y.clamp(-1e7, 1e7) } else { 0.0 };
     let height = if height.is_finite() { height.max(0.0) } else { 0.0 };
@@ -193,7 +201,7 @@ pub(crate) fn paint(laid: &Laid, paths: &GlyphPaths, scroll_y: f32, height: f32,
                 }
                 let mut pb = PathBuilder::new();
                 for g in run {
-                    let Some(path) = paths.get(&(*face, g.id)) else { continue };
+                    let Some(path) = paths.get(&(*face, g.id)).or_else(|| extra.get(&(*face, g.id))) else { continue };
                     let ox = (x + g.x) * scale;
                     let oy = (y + g.y - scroll_y) * scale;
                     let s = k * scale;
@@ -241,6 +249,8 @@ pub(crate) fn paint(laid: &Laid, paths: &GlyphPaths, scroll_y: f32, height: f32,
                 let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..PixmapPaint::default() };
                 pixmap.draw_pixmap(0, 0, (**img).as_ref(), &paint, ts, mask);
             }
+            // A marker for the form painter; drawn by the items it adds.
+            DisplayItem::Field { .. } => {}
             DisplayItem::Quad { points, color } => {
                 if color.a == 0 {
                     continue;

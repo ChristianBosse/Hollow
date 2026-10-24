@@ -24,6 +24,7 @@ mod content;
 mod css;
 mod data_url;
 mod dom;
+mod fields;
 mod form;
 mod image;
 mod layout;
@@ -428,34 +429,51 @@ impl Layout {
     /// `ceil(height * scale)` pixels; see [`Frame`] for the format. `scale`
     /// is clamped to 0.1..=8 and frames to 16384 px per side and 64 Mpx.
     pub fn paint(&self, scroll_y: f32, height: f32, scale: f32) -> Frame {
-        let (width, height, rgba) = paint::paint(&self.laid, &self.paths, scroll_y, height, scale);
-        Frame { width, height, rgba }
+        self.paint_with(&self.laid.forms, scroll_y, height, scale)
     }
 
     /// Like [`Layout::paint`], with form controls showing `forms`' values,
     /// focus and open lists.
     pub fn paint_forms(&self, forms: &FormState, scroll_y: f32, height: f32, scale: f32) -> Frame {
-        let _ = forms;
-        self.paint(scroll_y, height, scale)
+        self.paint_with(&forms.forms, scroll_y, height, scale)
     }
 
-    /// Like [`Layout::hit_test`], also finding form controls and the
-    /// entries of an open `<select>` list.
+    fn paint_with(&self, forms: &form::Forms, scroll_y: f32, height: f32, scale: f32) -> Frame {
+        let (width, height, rgba) = match fields::decorate(&self.laid, forms, &self.paths) {
+            Some((laid, extra)) => paint::paint(&laid, &self.paths, &extra, scroll_y, height, scale),
+            None => paint::paint(&self.laid, &self.paths, &paint::GlyphPaths::new(), scroll_y, height, scale),
+        };
+        Frame { width, height, rgba }
+    }
+
+    /// Like [`Layout::hit_test`], also finding the entries of an open
+    /// `<select>` list, which float over the page.
     pub fn hit_test_forms(&self, forms: &FormState, x: f32, y: f32) -> Option<HitTarget> {
-        let _ = forms;
-        self.hit_test(x, y)
+        if let Some(list) = fields::open_list(&self.laid, &forms.forms)
+            && list.rect.contains(x, y)
+        {
+            let row = ((y - list.rect.y) / list.row_h).floor().max(0.0) as usize;
+            return Some(HitTarget::Option(ControlId(list.node), list.first + row.min(list.rows - 1)));
+        }
+        match self.hit_test(x, y) {
+            // A list box: which row.
+            Some(HitTarget::Control(id)) => match fields::list_box_row(&self.laid, &forms.forms, id.0, y) {
+                Some(row) => Some(HitTarget::Option(id, row)),
+                None => Some(HitTarget::Control(id)),
+            },
+            other => other,
+        }
     }
 
-    /// What is at a point in page coordinates (CSS px, y includes scroll).
+    /// What is at a point in page coordinates (CSS px, y includes scroll):
+    /// a link, or a form control (or its label).
     pub fn hit_test(&self, x: f32, y: f32) -> Option<HitTarget> {
         // Later areas were laid out on top of earlier ones.
-        self.laid
-            .links
-            .iter()
-            .rev()
-            .find(|(r, _)| r.contains(x, y))
-            .and_then(|(_, id)| self.laid.link_urls.get(*id as usize))
-            .map(|u| HitTarget::Link(u.clone()))
+        let (_, id) = self.laid.links.iter().rev().find(|(r, _)| r.contains(x, y))?;
+        match self.laid.link_targets.get(*id as usize)? {
+            layout::LinkTarget::Url(u) => Some(HitTarget::Link(u.clone())),
+            layout::LinkTarget::Control(n) => Some(HitTarget::Control(ControlId(*n))),
+        }
     }
 
     /// Every link region, for a broker-side hit-test map.
@@ -463,9 +481,11 @@ impl Layout {
         self.laid
             .links
             .iter()
-            .filter_map(|(r, id)| {
-                let url = self.laid.link_urls.get(*id as usize)?.clone();
-                Some(LinkArea { x: r.x, y: r.y, width: r.w, height: r.h, url })
+            .filter_map(|(r, id)| match self.laid.link_targets.get(*id as usize)? {
+                layout::LinkTarget::Url(url) => {
+                    Some(LinkArea { x: r.x, y: r.y, width: r.w, height: r.h, url: url.clone() })
+                }
+                layout::LinkTarget::Control(_) => None,
             })
             .collect()
     }

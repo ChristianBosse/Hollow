@@ -274,10 +274,6 @@ impl Forms {
         self.entry(node).map(|e| &e.control)
     }
 
-    pub fn is_control(&self, node: NodeId) -> bool {
-        self.index.contains_key(&node) || self.labels.contains_key(&node)
-    }
-
     pub fn is_disabled(&self, node: NodeId) -> bool {
         self.entry(node).is_some_and(|e| e.disabled)
     }
@@ -295,9 +291,18 @@ impl Forms {
             t => t,
         };
         match target {
-            Some(FormTarget::Option(select, i)) => {
+            Some(FormTarget::Option(select, i)) if !self.is_disabled(select) => {
                 self.open = None;
-                self.choose(select, i);
+                self.focused = Some(select);
+                match self.entry_mut(select).map(|e| &mut e.control) {
+                    // A list box with `multiple` toggles the clicked option.
+                    Some(Control::Select { options, selected, multiple: true, .. }) => {
+                        if options.get(i).is_some_and(|o| !o.disabled) {
+                            selected[i] = !selected[i];
+                        }
+                    }
+                    _ => self.choose(select, i),
+                }
                 return Interaction::Repaint;
             }
             Some(FormTarget::Control(n)) if !self.is_disabled(n) => {
