@@ -154,10 +154,26 @@ impl Ctx<'_> {
             line_base.push(max_base);
         }
 
-        // Place everything.
-        let total_cross: f32 = line_cross.iter().sum::<f32>() + gap_cross * line_cross.len().saturating_sub(1) as f32;
-        let mut content_main = 0.0f32;
+        // Lines share out the free cross space (`align-content`).
+        let mut total_cross: f32 =
+            line_cross.iter().sum::<f32>() + gap_cross * line_cross.len().saturating_sub(1) as f32;
+        let mut line_gap = 0.0f32;
         let mut cross_pos = 0.0f32;
+        if lines.len() > 1
+            && let Some(size) = single_cross
+        {
+            let free = size - total_cross;
+            if st.align_content == Justify::Stretch {
+                if free > 0.0 {
+                    let share = free / lines.len() as f32;
+                    line_cross.iter_mut().for_each(|c| *c += share);
+                }
+            } else if free >= 0.0 || matches!(st.align_content, Justify::End | Justify::Center) {
+                (cross_pos, line_gap) = justify(st.align_content, free, lines.len());
+            }
+            total_cross = size;
+        }
+        let mut content_main = 0.0f32;
         let mut first_baseline = None;
         for (li, line) in lines.iter().enumerate() {
             let n = line.len();
@@ -231,7 +247,7 @@ impl Ctx<'_> {
                     first_baseline = it.baseline.map(|b| b + dy);
                 }
             }
-            cross_pos += lc + gap_cross;
+            cross_pos += lc + gap_cross + line_gap;
         }
         self.cb_h = saved_cb_h;
         let content_h = if row { total_cross } else { height.unwrap_or(content_main) };
@@ -322,6 +338,9 @@ impl Ctx<'_> {
             it.min = match (!b.anon).then(|| definite(cs.min_height, height)).flatten() {
                 Some(v) => v + adj_h,
                 None if clips => 0.0,
+                // A table's specified height isn't a minimum for flexing;
+                // its rows are.
+                None if matches!(b.kind, Kind::Table { .. }) => self.table_rows_h.get(&c).copied().unwrap_or(0.0),
                 None => content.min(it.base.max(content)),
             };
             if let Some(m) = cs.max_height.filter(|_| !b.anon).and_then(|m| definite(m, height)) {

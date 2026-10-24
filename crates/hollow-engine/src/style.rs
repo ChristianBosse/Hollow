@@ -331,7 +331,8 @@ impl Style {
             justify_content: Justify::Start,
             align_items: Align::Stretch,
             align_self: Align::Auto,
-            align_content: Justify::Start,
+            // `normal`, which is `stretch` for flex containers.
+            align_content: Justify::Stretch,
             flex_grow: 0.0,
             flex_shrink: 1.0,
             flex_basis: Len::Auto,

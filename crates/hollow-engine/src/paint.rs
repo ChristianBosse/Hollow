@@ -203,7 +203,9 @@ pub(crate) fn paint(
                 for g in run {
                     let Some(path) = paths.get(&(*face, g.id)).or_else(|| extra.get(&(*face, g.id))) else { continue };
                     let ox = (x + g.x) * scale;
-                    let oy = (y + g.y - scroll_y) * scale;
+                    // Baselines snap to whole device pixels, as in browsers, so glyph
+                    // edges line up with the (snapped) boxes around them.
+                    let oy = ((y - scroll_y) * scale).round() + g.y * scale;
                     let s = k * scale;
                     // Font units are y-up; the page is y-down.
                     let map = |p: tiny_skia::Point| (ox + p.x * s, oy - p.y * s);
@@ -277,10 +279,15 @@ pub(crate) fn paint(
                 }
                 pb.close();
                 if let Some(path) = pb.finish() {
-                    pixmap.fill_path(&path, &paint_for(*color), FillRule::Winding, Transform::identity(), mask);
+                    // Not antialiased: neighbouring sides then share the
+                    // diagonal pixel for pixel, with no seam for the
+                    // background to show through.
+                    let mut paint = paint_for(*color);
+                    paint.anti_alias = false;
+                    pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), mask);
                 }
             }
-            DisplayItem::Background { area, radius, tile, repeat, image, .. } => {
+            DisplayItem::Background { area, radius, tile, repeat, gap, image, .. } => {
                 if area.w <= 0.0 || area.h <= 0.0 || tile.w <= 0.0 || tile.h <= 0.0 {
                     continue;
                 }
@@ -318,40 +325,53 @@ pub(crate) fn paint(
                 let (ox, oy) = (tile.x * scale, (tile.y - scroll_y) * scale);
                 let (tw, th) = (tile.w * scale, tile.h * scale);
                 let repeats = repeat[0] || repeat[1];
+                let covers = |a0: f32, a1: f32, t0: f32, t1: f32| t0 <= a0 && t1 >= a1;
+                let whole = (!repeat[0] || covers(fill.x, fill.x + fill.w, tile.x, tile.x + tile.w))
+                    && (!repeat[1] || covers(fill.y, fill.y + fill.h, tile.y, tile.y + tile.h));
                 // Kept alive for the pattern that borrows it.
                 let tile_pixmap;
                 let mut paint = Paint { anti_alias: rounded, ..Paint::default() };
                 match image {
-                    BgSource::Image(id) => {
+                    BgSource::Image(id) if *gap == [0.0; 2] => {
                         let Some(img) = laid.images.get(*id as usize) else { continue };
                         let ts =
                             Transform::from_row(tw / img.width() as f32, 0.0, 0.0, th / img.height() as f32, ox, oy);
                         let spread = if repeats { SpreadMode::Repeat } else { SpreadMode::Pad };
                         paint.shader = Pattern::new((**img).as_ref(), spread, FilterQuality::Bilinear, 1.0, ts);
                     }
-                    BgSource::Gradient(g) => {
-                        let covers = |a0: f32, a1: f32, t0: f32, t1: f32| t0 <= a0 && t1 >= a1;
-                        let whole = (!repeat[0] || covers(fill.x, fill.x + fill.w, tile.x, tile.x + tile.w))
-                            && (!repeat[1] || covers(fill.y, fill.y + fill.h, tile.y, tile.y + tile.h));
-                        if whole {
-                            let ts = Transform::from_row(scale, 0.0, 0.0, scale, ox, oy);
-                            let Some(shader) = gradient_shader(g, ts) else { continue };
-                            paint.shader = shader;
-                        } else {
-                            // Smaller tiles that repeat: draw one, then tile it.
-                            let (pw, ph) = (tile_px(tw), tile_px(th));
-                            let Some(mut p) = Pixmap::new(pw, ph) else { continue };
-                            let k = Transform::from_scale(pw as f32 / tile.w, ph as f32 / tile.h);
-                            let Some(shader) = gradient_shader(g, k) else { continue };
-                            let full = SkRect::from_xywh(0.0, 0.0, pw as f32, ph as f32);
-                            if let Some(r) = full {
-                                p.fill_rect(r, &Paint { shader, ..Paint::default() }, Transform::identity(), None);
+                    BgSource::Gradient(g) if whole => {
+                        let ts = Transform::from_row(scale, 0.0, 0.0, scale, ox, oy);
+                        let Some(shader) = gradient_shader(g, ts) else { continue };
+                        paint.shader = shader;
+                    }
+                    _ => {
+                        // Draw one tile, with the space after it, offscreen
+                        // and repeat that.
+                        let (cw, ch) = (tile.w + gap[0], tile.h + gap[1]);
+                        let (pw, ph) = (tile_px(cw * scale), tile_px(ch * scale));
+                        let Some(mut p) = Pixmap::new(pw, ph) else { continue };
+                        let (kx, ky) = (pw as f32 / cw, ph as f32 / ch);
+                        let shader = match image {
+                            BgSource::Image(id) => {
+                                let Some(img) = laid.images.get(*id as usize) else { continue };
+                                let ts = Transform::from_scale(
+                                    tile.w * kx / img.width() as f32,
+                                    tile.h * ky / img.height() as f32,
+                                );
+                                Pattern::new((**img).as_ref(), SpreadMode::Pad, FilterQuality::Bilinear, 1.0, ts)
                             }
-                            tile_pixmap = p;
-                            let ts = Transform::from_row(tw / pw as f32, 0.0, 0.0, th / ph as f32, ox, oy);
-                            let q = FilterQuality::Bilinear;
-                            paint.shader = Pattern::new(tile_pixmap.as_ref(), SpreadMode::Repeat, q, 1.0, ts);
+                            BgSource::Gradient(g) => {
+                                let Some(s) = gradient_shader(g, Transform::from_scale(kx, ky)) else { continue };
+                                s
+                            }
+                        };
+                        if let Some(r) = SkRect::from_xywh(0.0, 0.0, tile.w * kx, tile.h * ky) {
+                            p.fill_rect(r, &Paint { shader, ..Paint::default() }, Transform::identity(), None);
                         }
+                        tile_pixmap = p;
+                        let ts = Transform::from_row(cw * scale / pw as f32, 0.0, 0.0, ch * scale / ph as f32, ox, oy);
+                        let q = FilterQuality::Bilinear;
+                        paint.shader = Pattern::new(tile_pixmap.as_ref(), SpreadMode::Repeat, q, 1.0, ts);
                     }
                 }
                 pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), mask);
@@ -361,7 +381,7 @@ pub(crate) fn paint(
     (w, h, pixmap.take())
 }
 
-/// Device size of an offscreen gradient tile: at least one pixel, and not
+/// Device size of an offscreen tile: at least one pixel, and not
 /// so large that a hostile page can make us allocate much.
 fn tile_px(v: f32) -> u32 {
     if v.is_finite() { v.ceil().clamp(1.0, MAX_TILE_SIDE as f32) as u32 } else { 1 }

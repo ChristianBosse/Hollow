@@ -408,8 +408,13 @@ impl Ctx<'_> {
                 deco.padding = geometry(cell_style, cb.anon, cw).padding;
                 let m = self.mark();
                 let (h, cell_base) = self.layout_cell(cell, cx, cw, y, border);
-                let valign = if cb.anon { VAlign::Baseline } else { cell_style.vertical_align };
-                let rel = cell_base - y;
+                let mut valign = if cb.anon { VAlign::Baseline } else { cell_style.vertical_align };
+                // A cell without a line of its own takes no part in the
+                // row's baseline (its baseline is its content box bottom).
+                if cell_base.is_none() && baseline_aligned(valign) {
+                    valign = VAlign::Top;
+                }
+                let rel = cell_base.unwrap_or(y + h - geometry(cell_style, cb.anon, cw).padding[2] - border[2]) - y;
                 if baseline_aligned(valign) {
                     base = base.max(rel);
                 }
@@ -432,6 +437,7 @@ impl Ctx<'_> {
         // A table taller than its rows (`height`) shares the rest out among
         // them, in proportion to their heights.
         let content_h = y + pb + bb - table_top;
+        self.table_rows_h.insert(id, content_h);
         let vpad = pt + pb + bt + bb;
         let min_h = force_h
             .or_else(|| {
@@ -457,7 +463,12 @@ impl Ctx<'_> {
                     VAlign::Top => 0.0,
                     _ => r.base - p.base,
                 };
-                self.shift_span(&p.span, 0.0, r.y - laid_y + dy);
+                // Aligning the contents leaves absolutely positioned boxes'
+                // static positions where they were.
+                let mut contents = p.span.clone();
+                contents.pending = contents.pending.start..contents.pending.start;
+                self.shift_span(&p.span, 0.0, r.y - laid_y);
+                self.shift_span(&contents, 0.0, dy);
                 let mut d = p.deco;
                 d.rect = Rect { x: p.x, y: r.y, w: p.w, h: r.h };
                 self.paint_deco(cell_style, &d);
@@ -552,9 +563,8 @@ impl Ctx<'_> {
     }
 
     /// Lays out a cell's contents as an independent formatting context.
-    /// Returns its border-box height and its baseline: that of its first
-    /// line, or the bottom of its content box without one.
-    fn layout_cell(&mut self, cell: BoxId, cx: f32, cw: f32, y: f32, border: [f32; 4]) -> (f32, f32) {
+    /// Returns its border-box height and the baseline of its first line.
+    fn layout_cell(&mut self, cell: BoxId, cx: f32, cw: f32, y: f32, border: [f32; 4]) -> (f32, Option<f32>) {
         let boxes = self.boxes;
         let styles = self.styles;
         let b = &boxes[cell];
@@ -568,7 +578,11 @@ impl Ctx<'_> {
         let mut f = Flow::new(top);
         self.floats.push(FloatCtx::default());
         let saved = self.cb_h;
-        self.cb_h = None;
+        // A cell's own height is what percentages inside it refer to.
+        self.cb_h = match st.height {
+            Len::Px(h) if !b.anon => Some((h - if st.border_box { pt + pb + bt + bb } else { 0.0 }).max(0.0)),
+            _ => None,
+        };
         let baseline = match &b.kind {
             Kind::Table { .. } => self.layout_table(cell, content_x, content_w, &mut f),
             _ => self.layout_contents(cell, content_x, content_w, &mut f, None),
@@ -582,7 +596,7 @@ impl Ctx<'_> {
             let h = if st.border_box { h - pt - pb - bt - bb } else { h };
             end = end.max(top + h);
         }
-        (end - y + pb + bb, baseline.unwrap_or(end))
+        (end - y + pb + bb, baseline)
     }
 }
 

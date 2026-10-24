@@ -3,8 +3,7 @@
 //! display items that the painter tiles.
 //!
 //! `background-attachment: fixed` positions against the top of the page
-//! (fixed things scroll with the page in Hollow). `space` repeats like
-//! `repeat`.
+//! (fixed things scroll with the page in Hollow).
 
 use std::sync::Arc;
 
@@ -122,14 +121,27 @@ impl Ctx<'_> {
         if tw <= 0.0 || th <= 0.0 {
             return None;
         }
-        let mut x = origin.x + resolve(layer.position[0], origin.w - tw);
-        let mut y = origin.y + resolve(layer.position[1], origin.h - th);
-        if layer.repeat[0] == Repeat::Space {
-            x = origin.x;
+        let mut pos = [
+            origin.x + resolve(layer.position[0], origin.w - tw),
+            origin.y + resolve(layer.position[1], origin.h - th),
+        ];
+        let mut repeat = layer.repeat.map(|r| r != Repeat::NoRepeat);
+        // `space`: as many whole tiles as fit, the first and last touching
+        // the edges and the rest spread evenly between; with room for only
+        // one, it is placed as if not repeated.
+        let mut gap = [0.0f32; 2];
+        for (axis, (start, len, t)) in [(origin.x, origin.w, tw), (origin.y, origin.h, th)].into_iter().enumerate() {
+            if layer.repeat[axis] == Repeat::Space {
+                let n = (len / t).floor();
+                if n >= 2.0 {
+                    pos[axis] = start;
+                    gap[axis] = (len - n * t) / (n - 1.0);
+                } else {
+                    repeat[axis] = false;
+                }
+            }
         }
-        if layer.repeat[1] == Repeat::Space {
-            y = origin.y;
-        }
+        let [x, y] = pos;
         let source = match (&layer.image, image) {
             (Image::Gradient(g), _) => BgSource::Gradient(Arc::new(resolve_gradient(g, tw, th, st.color)?)),
             (_, Some(i)) => BgSource::Image(i),
@@ -139,7 +151,8 @@ impl Ctx<'_> {
             area: clip,
             radius: clip_radius,
             tile: Rect { x, y, w: tw, h: th },
-            repeat: layer.repeat.map(|r| r != Repeat::NoRepeat),
+            repeat,
+            gap,
             image: source,
             fixed: layer.fixed,
         })

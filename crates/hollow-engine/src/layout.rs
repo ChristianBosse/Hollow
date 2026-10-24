@@ -67,9 +67,10 @@ const PHASE_FLOAT: u8 = 1;
 const PHASE_INLINE: u8 = 2;
 const PHASE_POSITIONED: u8 = 3;
 const PAINT_DEPTH: usize = 4;
-/// Where an item paints within its layer: its phase in each enclosing
-/// atomic box, outermost first.
-type PaintKey = [u8; PAINT_DEPTH];
+/// Where an item paints within its layer: for each enclosing atomic box,
+/// outermost first, its phase and when it started (so each atomic box
+/// paints whole, after the ones before it), then the item's own phase.
+type PaintKey = [(u8, u32); PAINT_DEPTH];
 /// `data:` images one layout may decode, and their total pixels.
 const MAX_DATA_IMAGES: usize = 256;
 const MAX_DATA_PIXELS: u64 = 16 * 1024 * 1024;
@@ -1103,6 +1104,8 @@ pub(crate) enum DisplayItem {
         radius: f32,
         tile: Rect,
         repeat: [bool; 2],
+        /// Space between repeated tiles (`background-repeat: space`).
+        gap: [f32; 2],
         image: BgSource,
         /// The tile is placed on the page and stays put when the box moves.
         fixed: bool,
@@ -1412,6 +1415,8 @@ struct Ctx<'a> {
     /// many there are.
     paint_path: PaintKey,
     paint_depth: usize,
+    /// Counts atomic boxes started, for [`PaintKey`].
+    paint_seq: u32,
     clip: u32,
     /// The float context of each enclosing block formatting context.
     floats: Vec<FloatCtx>,
@@ -1442,6 +1447,8 @@ struct Ctx<'a> {
     root_node: Option<NodeId>,
     root_deco: Option<Deco>,
     canvas_deco: Option<Deco>,
+    /// Border-box height of each table's rows, without its own `height`.
+    table_rows_h: BTreeMap<BoxId, f32>,
 }
 
 /// Viewport widths are clamped to 1..=16384 CSS px; NaN becomes 1024.
@@ -1498,8 +1505,9 @@ pub(crate) fn layout(dom: &Dom, styles: &Styles, generated: &Generated, resource
         glyphs: Vec::new(),
         links: Vec::new(),
         z: 0,
-        paint_path: [0; PAINT_DEPTH],
+        paint_path: [(0, 0); PAINT_DEPTH],
         paint_depth: 0,
+        paint_seq: 0,
         clip: 0,
         floats: vec![FloatCtx::default()],
         abs: vec![Vec::new()],
@@ -1511,6 +1519,7 @@ pub(crate) fn layout(dom: &Dom, styles: &Styles, generated: &Generated, resource
         root_node: dom.nodes[0].children.iter().copied().find(|&c| dom.element(c).is_some()),
         root_deco: None,
         canvas_deco: None,
+        table_rows_h: BTreeMap::new(),
         image_ids: &image_ids,
         images: &images,
         canvas_layers: Vec::new(),
@@ -1655,7 +1664,7 @@ impl Ctx<'_> {
     fn push_in(&mut self, it: DisplayItem, phase: u8) {
         let mut key = self.paint_path;
         if let Some(k) = key.get_mut(self.paint_depth) {
-            *k = phase;
+            *k = (phase, self.paint_seq);
         }
         self.out.push(it);
         self.item_z.push((self.z, key));
@@ -1675,7 +1684,8 @@ impl Ctx<'_> {
     /// `paint_path` and `paint_depth` when it ends.
     fn enter_atomic(&mut self, phase: u8) {
         if let Some(k) = self.paint_path.get_mut(self.paint_depth) {
-            *k = phase;
+            self.paint_seq += 1;
+            *k = (phase, self.paint_seq);
             self.paint_depth += 1;
         }
     }
@@ -2003,7 +2013,8 @@ impl Ctx<'_> {
         let [bt, br, bb, bl] = g.border;
         let (hpad, vpad) = (g.hpad(), g.vpad());
         let placed = force_w.is_some();
-        let bfc = !b.anon && (placed || new_context(st, &b.kind));
+        // The root element's margins never collapse with its children's.
+        let bfc = !b.anon && (placed || new_context(st, &b.kind) || Some(b.style) == self.root_node);
         if g.auto[3] {
             ml = 0.0;
         }
@@ -2024,9 +2035,7 @@ impl Ctx<'_> {
         }
         // Boxes placed by someone else (floats, flex items, ...) were
         // cleared by them, and are laid out at the origin meanwhile.
-        if !b.anon && !placed && st.clear != Clear::None {
-            self.clear(st.clear, mt, flow);
-        }
+        let cleared = !b.anon && !placed && st.clear != Clear::None && self.clear(st.clear, mt, flow);
         let mut box_x = x + ml;
         // A new formatting context never overlaps floats: it moves in next
         // to them, narrowing if its width is automatic.
@@ -2076,6 +2085,8 @@ impl Ctx<'_> {
             .map(|h| (h - vpad).max(0.0))
             .or_else(|| (!b.anon).then(|| self.definite_height(st.height)).flatten().map(|h| (h - adj).max(0.0)));
         let min_h = if b.anon { 0.0 } else { self.definite_height(st.min_height).map_or(0.0, |h| (h - adj).max(0.0)) };
+        // A list marker makes a line of its own, even in an empty item.
+        let marker_h = if b.marker.is_some() && st.visible { text_metrics(st).2 } else { 0.0 };
         let max_h = if b.anon {
             f32::INFINITY
         } else {
@@ -2097,13 +2108,20 @@ impl Ctx<'_> {
             && pb <= 0.0
             && bb <= 0.0
             && definite.is_none_or(|h| h <= 0.0)
-            && min_h <= 0.0;
+            && min_h <= 0.0
+            && (marker_h <= 0.0 || definite.is_some());
         let (border_top, border_bottom) = if collapsed {
             // Nothing placed and nothing separating the margins: the box
             // collapses through, and its margins join the surrounding ones.
             let y = inner.y + inner.margin.value().max(0.0);
             flow.y = inner.y;
             flow.margin = inner.margin;
+            if cleared {
+                // Its position is fixed by the clearance; only the margins
+                // below collapse.
+                flow.y = y;
+                flow.margin = Margin::default();
+            }
             flow.margin.push(mb);
             (y, y)
         } else {
@@ -2125,7 +2143,7 @@ impl Ctx<'_> {
             }
             content_h = match definite {
                 Some(h) => h,
-                None => content_h.min(max_h).max(min_h),
+                None => content_h.max(marker_h).min(max_h).max(min_h),
             };
             let bottom = content_top + clamp_extent(content_h) + pb + bb;
             flow.y = bottom;
@@ -2152,6 +2170,13 @@ impl Ctx<'_> {
             self.finish_frame(pad);
         }
         (self.cb_h, self.z, self.clip, self.paint_path, self.paint_depth) = saved;
+        let first_baseline = match first_baseline {
+            None if b.marker.is_some() && st.visible => {
+                let (a, d, lh) = text_metrics(st);
+                Some(border_top + bt + pt + (lh - a - d) / 2.0 + a)
+            }
+            fb => fb,
+        };
         self.marker(b, st, content_x, border_top + bt + pt, first_baseline);
         if !b.anon && st.position == crate::style::Position::Relative {
             let (dx, dy) = self.relative_offset(st, cb_w);
@@ -2546,6 +2571,9 @@ impl Ctx<'_> {
         };
         // The strut: every line is at least as tall as the block's own font.
         let (mut above, mut below) = half_leading(block);
+        // Objects aligned to the line's top or bottom only make it taller.
+        let mut edge_h = 0.0f32;
+        let edge = |st: &Style| matches!(st.vertical_align, VAlign::Top | VAlign::Bottom);
         for f in &line.frags {
             let st = &styles[items[f.item as usize].style()];
             let shift = baseline_shift(st);
@@ -2555,6 +2583,7 @@ impl Ctx<'_> {
                     above = above.max(a - shift);
                     below = below.max(d + shift);
                 }
+                FragKind::Object { h, .. } if edge(st) => edge_h = edge_h.max(h),
                 FragKind::Object { h, base } => {
                     above = above.max(base - shift);
                     below = below.max(h - base + shift);
@@ -2563,7 +2592,12 @@ impl Ctx<'_> {
             }
         }
         // A line holding only out-of-flow markers takes no room.
-        let height = if line.content || line.frags.is_empty() { (above + below).max(0.0) } else { 0.0 };
+        let height = if line.content || line.frags.is_empty() { (above + below).max(edge_h).max(0.0) } else { 0.0 };
+        let object_y = |st: &Style, h: f32, base: f32, by: f32| match st.vertical_align {
+            VAlign::Top => top,
+            VAlign::Bottom => top + height - h,
+            _ => by - base,
+        };
         let baseline = top + above;
         let offset = match block.text_align {
             TextAlign::Left => 0.0,
@@ -2581,7 +2615,7 @@ impl Ctx<'_> {
                 }
                 continue;
             }
-            if let FragKind::Object { base, h } = f.kind
+            if let FragKind::Object { h, base } = f.kind
                 && let Some(m) = &measured[f.item as usize]
             {
                 // Inline-blocks draw themselves (and their own links); a
@@ -2589,10 +2623,10 @@ impl Ctx<'_> {
                 if let Some(link) = item.link()
                     && st.visible
                 {
-                    self.links.push((Rect { x: fx, y: by - base, w: f.w, h }, link));
+                    self.links.push((Rect { x: fx, y: object_y(st, h, base, by), w: f.w, h }, link));
                 }
                 let span = m.span.clone();
-                self.shift_span(&span, fx, by - base);
+                self.shift_span(&span, fx, object_y(st, h, base, by));
                 continue;
             }
             if let Some(link) = item.link()
@@ -2645,7 +2679,7 @@ impl Ctx<'_> {
                     }
                 }
                 FragKind::Object { h, base } => {
-                    let rect = Rect { x: fx, y: by - base, w: f.w, h: *h };
+                    let rect = Rect { x: fx, y: object_y(st, *h, *base, by), w: f.w, h: *h };
                     self.draw_object(item, rect, Some(st));
                 }
                 FragKind::Abs => {}
