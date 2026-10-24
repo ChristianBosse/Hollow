@@ -5,8 +5,11 @@
 //! byte through Tor. Because stdout is the IPC channel, all logging goes to
 //! stderr.
 
+mod ct;
 mod fetch;
+mod pq;
 mod profile;
+mod tls;
 mod tor;
 
 use std::io;

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -11,34 +11,26 @@ use hyper::Request;
 use hyper::header::{ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONTENT_TYPE, HOST, ORIGIN, REFERER, USER_AGENT};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsConnector;
 
 use crate::profile;
+use crate::tls::{self, SiteConfigs};
 use crate::tor::Client;
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub struct Fetcher {
     client: Client,
-    tls: TlsConnector,
+    /// TLS session state per first-party site (STATE-03).
+    tls: SiteConfigs,
     /// One Tor circuit family per first-party site (NET-05).
     isolation: Mutex<HashMap<String, IsolationToken>>,
 }
 
 impl Fetcher {
     pub fn new(client: Client) -> Self {
-        // Bundled roots, never the Windows store: every Hollow user trusts
-        // exactly the same CAs.
-        let roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-        let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .expect("ring supports the default TLS versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Self { client, tls: TlsConnector::from(Arc::new(config)), isolation: Mutex::new(HashMap::new()) }
+        Self { client, tls: SiteConfigs::new(tls::client_config()), isolation: Mutex::new(HashMap::new()) }
     }
 
     fn isolation_for(&self, key: &str) -> IsolationToken {
@@ -63,7 +55,8 @@ impl Fetcher {
 
         if req.tls {
             let name = ServerName::try_from(req.host.clone()).context("invalid server name")?;
-            let tls = self.tls.connect(name, stream).await.context("TLS handshake")?;
+            let connector = TlsConnector::from(self.tls.for_site(&req.isolation_key));
+            let tls = connector.connect(name, stream).await.context("TLS handshake")?;
             http_request(tls, req).await
         } else {
             http_request(stream, req).await

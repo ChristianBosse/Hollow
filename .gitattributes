@@ -1,0 +1,3 @@
+# Signed upstream bytes and test fixtures: never convert line endings.
+crates/hollow-net/ct/** -text
+crates/hollow-net/testdata/** -text
