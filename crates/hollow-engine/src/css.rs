@@ -441,6 +441,9 @@ enum Pseudo {
     /// `:checked`, from the `checked` / `selected` attributes: nothing can
     /// toggle them in a static render.
     Checked,
+    /// `:required` when true, `:optional` when false: form controls by
+    /// their `required` attribute.
+    Required(bool),
     /// `:nth-child(an+b)` and the other structural pseudo-classes
     /// (`:first-child` is `a = 0, b = 1`).
     Nth {
@@ -552,10 +555,11 @@ impl Stylesheet {
                 break;
             }
             let at_rule = b[pos] == b'@';
-            // A `;` or `}` ends an at-rule statement; for a style rule it is
-            // part of the selector, which makes the whole rule invalid (so
-            // `p {} ; q {}` drops the `q` rule, as browsers do).
-            let stops: &[u8] = if at_rule { b"{;}" } else { b"{" };
+            // A `;` ends an at-rule statement; for a style rule it is part of
+            // the selector, which makes the whole rule invalid (so
+            // `p {} ; q {}` drops the `q` rule, as browsers do). Stray `}`
+            // and other closers are just tokens.
+            let stops: &[u8] = if at_rule { b"{;" } else { b"{" };
             let (i, stop) = find_top_level(b, pos, stops);
             match stop {
                 Some(b'{') => {
@@ -867,6 +871,9 @@ fn compound_matches(c: &Compound, tree: &Tree<'_>, node: NodeId, budget: &mut u3
             "option" => el.attr("selected").is_some(),
             _ => false,
         },
+        &Pseudo::Required(required) => {
+            matches!(el.name.as_str(), "input" | "select" | "textarea") && el.attr("required").is_some() == required
+        }
         &Pseudo::Nth { a, b, of_type, from_end } => {
             let (index, count) = if of_type { (info.type_index, info.type_count) } else { (info.index, info.count) };
             let k = if from_end { i64::from(count) - i64::from(index) + 1 } else { i64::from(index) };
@@ -1178,7 +1185,8 @@ fn strip_comments(s: &str) -> String {
 /// strings and parenthesized/bracketed groups. Structural characters are
 /// ASCII, so byte offsets found here are always char boundaries.
 fn find_top_level(b: &[u8], from: usize, stops: &[u8]) -> (usize, Option<u8>) {
-    let mut depth = 0usize;
+    // Closers to expect, innermost last; a stray one is just a token.
+    let mut open: Vec<u8> = Vec::new();
     let mut i = from;
     while i < b.len() {
         let c = b[i];
@@ -1193,9 +1201,12 @@ fn find_top_level(b: &[u8], from: usize, stops: &[u8]) -> (usize, Option<u8>) {
                 }
             }
             b'\\' => i += 1,
-            b'(' | b'[' => depth += 1,
-            b')' | b']' => depth = depth.saturating_sub(1),
-            _ if depth == 0 && stops.contains(&c) => return (i, Some(c)),
+            b'(' => open.push(b')'),
+            b'[' => open.push(b']'),
+            b')' | b']' if open.last() == Some(&c) => {
+                open.pop();
+            }
+            _ if open.is_empty() && stops.contains(&c) => return (i, Some(c)),
             _ => {}
         }
         i += 1;
@@ -1205,8 +1216,10 @@ fn find_top_level(b: &[u8], from: usize, stops: &[u8]) -> (usize, Option<u8>) {
 
 /// Given the index of a `{`, returns (index after the matching `}`, index of
 /// that `}`), or the end of input for an unterminated block.
+/// Brackets nest as CSS Syntax says: inside `(...)` or `[...]` a `}` is
+/// just a token and doesn't end the block, and stray closers are ignored.
 fn skip_block(b: &[u8], open: usize) -> (usize, usize) {
-    let mut depth = 0usize;
+    let mut open_brackets: Vec<u8> = Vec::new();
     let mut i = open;
     while i < b.len() {
         let c = b[i];
@@ -1221,10 +1234,12 @@ fn skip_block(b: &[u8], open: usize) -> (usize, usize) {
                 }
             }
             b'\\' => i += 1,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
+            b'{' => open_brackets.push(b'}'),
+            b'(' => open_brackets.push(b')'),
+            b'[' => open_brackets.push(b']'),
+            b'}' | b')' | b']' if open_brackets.last() == Some(&c) => {
+                open_brackets.pop();
+                if open_brackets.is_empty() {
                     return (i + 1, i);
                 }
             }
@@ -1451,6 +1466,8 @@ fn parse_selector(s: &str, depth: usize) -> Option<Selector> {
                     // In a stylesheet, `:scope` is the root.
                     "root" | "scope" => cur.pseudo.push(Pseudo::Root),
                     "checked" => cur.pseudo.push(Pseudo::Checked),
+                    "required" => cur.pseudo.push(Pseudo::Required(true)),
+                    "optional" => cur.pseudo.push(Pseudo::Required(false)),
                     "empty" => cur.pseudo.push(Pseudo::Empty),
                     "first-child" => cur.pseudo.push(nth(0, 1, false, false)),
                     "last-child" => cur.pseudo.push(nth(0, 1, false, true)),
@@ -2191,7 +2208,9 @@ fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>, base: Base<'_>) 
             return;
         }
         "justify-content" => parse_justify(&lower).map(Decl::JustifyContent),
-        "align-content" => parse_justify(&lower).map(Decl::AlignContent),
+        "align-content" => {
+            parse_justify(&lower).map(|j| Decl::AlignContent(if lower == "normal" { Justify::Stretch } else { j }))
+        }
         "place-content" => {
             let mut it = lower.split_whitespace();
             let first = it.next().and_then(parse_justify);

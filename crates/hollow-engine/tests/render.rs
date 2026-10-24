@@ -285,7 +285,7 @@ fn golden_frame_hash() {
     let f = layout(html, 320.0).paint(0.0, 240.0, 1.25);
     assert_eq!(fnv(&f.rgba), GOLDEN, "frame hash changed: {:#x}", fnv(&f.rgba));
 }
-const GOLDEN: u64 = 0x764e6a6aef46586c;
+const GOLDEN: u64 = 0x2ef0e25c2a1194bd;
 
 #[test]
 fn degenerate_parameters_do_not_panic() {
@@ -961,6 +961,42 @@ fn floats_paint_over_block_backgrounds() {
     let html = "<div style='float:left; width:20px; height:20px; background:#0000ff'></div>\
                 <div style='height:20px; background:red'></div>";
     assert_eq!(pixel(&frame(html, 100.0, 30.0), 10, 10), BLUE);
+    // Positioned boxes paint whole, one after the other: the second one's
+    // background covers the first one's text.
+    let html = "<div style='position:absolute; width:100px; height:40px; color:#ff0000; font-size:30px'>XX</div>\
+                <div style='position:absolute; width:100px; height:40px; background:#0000ff'></div>";
+    let f = frame(html, 120.0, 50.0);
+    assert_eq!(text_color_ink(&f, [255, 0, 0]), 0);
+}
+
+#[test]
+fn alignment_fixes() {
+    // `vertical-align: top` puts an inline-block at the top of its line.
+    let html = "<div style='font-size:40px'>x<span style='display:inline-block; vertical-align:top; width:10px; \
+                height:10px; background:red'></span></div>";
+    let f = frame(html, 100.0, 60.0);
+    assert_eq!(pixel(&f, 25, 2), RED);
+    // `align-content` shares the free space of a wrapping flex container.
+    let item = "<div style='width:60px; height:10px; background:#0000ff'></div>";
+    let html = format!(
+        "<div style='display:flex; flex-wrap:wrap; align-content:center; width:60px; height:60px'>{item}{item}</div>"
+    );
+    let f = frame(&html, 100.0, 70.0);
+    assert_eq!(pixel(&f, 30, 5), WHITE);
+    assert_eq!(pixel(&f, 30, 25), BLUE);
+    assert_eq!(pixel(&f, 30, 35), BLUE);
+    // `:required` / `:optional`.
+    let html = "<style>input { color: red } input:required { background: #0000ff; padding: 5px; border: 0 }</style>\
+                <input required>";
+    assert!((0..60).any(|y| pixel(&frame(html, 200.0, 60.0), 20, y) == BLUE));
+    // `background-repeat: space`: whole tiles with even gaps between.
+    let html =
+        format!("<div style='width:50px; height:15px; background:url({YELLOW_PIXEL}) space 0 0 / 15px 15px'></div>");
+    let f = frame(&html, 100.0, 20.0);
+    assert_eq!(pixel(&f, 5, 5), YELLOW);
+    assert_eq!(pixel(&f, 16, 5), WHITE, "a 2.5px gap after the first of three tiles");
+    assert_eq!(pixel(&f, 25, 5), YELLOW);
+    assert_eq!(pixel(&f, 48, 5), YELLOW, "the last touches the edge");
 }
 
 #[test]

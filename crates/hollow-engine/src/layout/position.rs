@@ -74,16 +74,24 @@ impl Ctx<'_> {
 
     /// Clearance for a box with top margin `mt` (CSS 2.1 9.5.2): if its
     /// border edge would start above the floats `clear` names, it starts
-    /// at their bottom instead, and the margins above no longer collapse
-    /// with it.
-    pub(super) fn clear(&mut self, clear: Clear, mt: f32, flow: &mut Flow) {
+    /// at their bottom instead (true is returned), and margins above it no
+    /// longer collapse with its own.
+    pub(super) fn clear(&mut self, clear: Clear, mt: f32, flow: &mut Flow) -> bool {
         let bottom = self.floats_bottom(clear);
         let mut m = flow.margin;
         m.push(mt);
-        if bottom > flow.y + m.value() {
-            flow.y = bottom - mt;
-            flow.margin = Margin::default();
+        if bottom <= flow.y + m.value() {
+            return false;
         }
+        // A parent whose top margin would have collapsed through this box
+        // starts where it would have without it. (Whether there is
+        // clearance only looks at this box's own top margin, not at margins
+        // collapsing through it from its first children.)
+        let start = flow.next();
+        flow.first_place.get_or_insert(start);
+        flow.y = bottom - mt;
+        flow.margin = Margin::default();
+        true
     }
 
     pub(super) fn layout_float(&mut self, id: BoxId, x: f32, cb_w: f32, flow: &mut Flow) {
