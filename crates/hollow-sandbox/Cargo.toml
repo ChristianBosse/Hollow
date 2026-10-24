@@ -1,0 +1,16 @@
+[package]
+name = "hollow-sandbox"
+description = "Windows AppContainer sandboxing for Hollow's renderer and network processes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# This is the one crate allowed to use `unsafe` (architecture Â§1.3): every
+# call into the Windows API lives here, behind safe wrappers.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[dependencies]
+hollow-ipc.workspace = true
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Isolation", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Com", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_UI_WindowsAndMessaging", "Win32_System_Console"] }

@@ -1,0 +1,5 @@
+[toolchain]
+# Exact version: release builds must be reproducible (TRUST-02, `cargo xtask repro-check`).
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-msvc"]

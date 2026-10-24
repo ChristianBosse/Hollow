@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.lints.rust]
+# Only crates that must call the OS directly (hollow-sandbox) opt out of this.
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+hollow-engine = { path = "crates/hollow-engine" }
+hollow-ipc = { path = "crates/hollow-ipc" }
+hollow-sandbox = { path = "crates/hollow-sandbox" }
+
+[patch.crates-io]
+# Windows hang in Arti's consensus parsing; see third_party/README.md.
+saturating-time = { path = "third_party/saturating-time" }
+# RAM-only Tor: directory cache and state never touch the disk (P5).
+tor-dirmgr = { path = "third_party/tor-dirmgr" }
+arti-client = { path = "third_party/arti-client" }
+# Never resolve per-user folders (shell32 under Win32k lockdown, user name in memory).
+tor-config-path = { path = "third_party/tor-config-path" }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

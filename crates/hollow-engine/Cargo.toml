@@ -1,0 +1,25 @@
+[package]
+name = "hollow-engine"
+description = "Hollow's Fortress engine: HTML + CSS to deterministic RGBA pixels, no JavaScript"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+dejavu = "2.37.0"
+ego-tree = "0.11.1"
+gif = { version = "0.14.2", default-features = false, features = ["std"] }
+harfrust = "0.15.0"
+html5ever = "0.40.1"
+image-webp = "0.2.4"
+png = "0.18.1"
+scraper = "0.29.0"
+skrifa = "0.49.0"
+tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"] }
+url = "2.5.8"
+zune-core = "0.5.3"
+zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }

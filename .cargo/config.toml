@@ -1,0 +1,13 @@
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    # Static CRT: sandboxed processes never need to read vcruntime from disk,
+    # and portable mode needs no redistributable.
+    "-C", "target-feature=+crt-static",
+    # Control Flow Guard + CET shadow stack compatibility (architecture §3).
+    "-C", "control-flow-guard",
+    "-C", "link-arg=/CETCOMPAT",
+]
+
+[alias]
+# Developer checks (crates/xtask): `cargo xtask dist | repro-check | leak-test`.
+xtask = "run --package xtask --"
