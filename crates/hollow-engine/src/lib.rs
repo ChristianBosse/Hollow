@@ -30,6 +30,7 @@ mod image;
 mod layout;
 mod paint;
 mod style;
+mod svg;
 mod text;
 mod vars;
 
@@ -256,6 +257,8 @@ pub fn register_test_fonts(fonts: Vec<(String, Vec<u8>)>) -> bool {
 #[derive(Default)]
 pub struct Resources {
     images: BTreeMap<String, Arc<Pixmap>>,
+    /// URLs of images with a shape but no size of their own.
+    ratio_only: BTreeSet<String>,
     pixels: u64,
     stylesheets: BTreeMap<String, (Arc<css::Stylesheet>, usize)>,
     css_bytes: usize,
@@ -295,7 +298,7 @@ impl Resources {
         if replaced == 0 && self.images.len() >= MAX_RESOURCE_IMAGES {
             return Err(ImageError::BudgetExhausted);
         }
-        let pixmap = image::decode(bytes)?;
+        let (pixmap, ratio_only) = image::decode_sized(bytes)?;
         let pixels = u64::from(pixmap.width()) * u64::from(pixmap.height());
         if self.pixels - replaced + pixels > MAX_TOTAL_IMAGE_PIXELS {
             return Err(ImageError::BudgetExhausted);
@@ -303,6 +306,11 @@ impl Resources {
         self.pixels = self.pixels - replaced + pixels;
         let size = (pixmap.width(), pixmap.height());
         self.images.insert(url.as_str().to_owned(), Arc::new(pixmap));
+        if ratio_only {
+            self.ratio_only.insert(url.as_str().to_owned());
+        } else {
+            self.ratio_only.remove(url.as_str());
+        }
         Ok(size)
     }
 
@@ -339,6 +347,10 @@ impl Resources {
 
     pub(crate) fn get(&self, url: &Url) -> Option<Arc<Pixmap>> {
         self.images.get(url.as_str()).cloned()
+    }
+
+    pub(crate) fn ratio_only(&self, url: &Url) -> bool {
+        self.ratio_only.contains(url.as_str())
     }
 
     fn stylesheet(&self, url: &Url) -> Option<&css::Stylesheet> {

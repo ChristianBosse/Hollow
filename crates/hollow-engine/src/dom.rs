@@ -7,7 +7,7 @@
 //! accident. Depth, node count and text size are capped here, which bounds
 //! the recursion and work of every later stage.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use html5ever::tendril::TendrilSink;
@@ -73,6 +73,8 @@ pub(crate) struct Dom {
     pub quirks: bool,
     /// What relative URLs in the page resolve against (`<base>` included).
     pub base: Arc<Url>,
+    /// Markup of each inline `<svg>` element, standalone (see `svg`).
+    pub svgs: BTreeMap<NodeId, String>,
 }
 
 impl Dom {
@@ -106,12 +108,15 @@ pub(crate) const MAX_STYLESHEETS: usize = 32;
 /// `<style>` + `<link>` elements considered for the cascade.
 const MAX_SHEET_SOURCES: usize = 256;
 
+/// Inline SVG markup one document may hold.
+const MAX_SVG_TOTAL: usize = 8 << 20;
+
 /// Elements whose whole subtree is dropped. `<noscript>` is deliberately
 /// absent: Fortress has no JavaScript, so noscript content is what the page
 /// wants shown.
 const DROPPED: &[&str] = &[
-    "script", "template", "iframe", "embed", "svg", "noembed", "noframes", "frameset", "frame", "param", "source",
-    "track", "link", "meta", "area", "datalist", "base", "slot", "applet",
+    "script", "template", "iframe", "embed", "noembed", "noframes", "frameset", "frame", "param", "source", "track",
+    "link", "meta", "area", "datalist", "base", "slot", "applet",
 ];
 
 enum Target {
@@ -201,7 +206,13 @@ pub(crate) fn parse(html: &str, base_url: &Url) -> Parsed {
         nodes: vec![Node { parent: None, children: Vec::new(), data: NodeData::Root, url: None }],
         quirks: parsed.quirks_mode == QuirksMode::Quirks,
         base: Arc::new(base_url.clone()),
+        svgs: BTreeMap::new(),
     };
+    // Inline SVGs and the elements with ids inside them, which other SVGs
+    // on the page may reference.
+    let mut svg_markup: Vec<(NodeId, String)> = Vec::new();
+    let mut svg_defs: BTreeMap<String, String> = BTreeMap::new();
+    let mut svg_bytes = 0usize;
     let mut base = base_url.clone();
     let mut base_seen = false;
     let mut title: Option<String> = None;
@@ -347,6 +358,17 @@ pub(crate) fn parse(html: &str, base_url: &Url) -> Parsed {
                         Target::Node(push(&mut dom, parent, NodeData::Element(el), url))
                     }
                 };
+                // An inline SVG is kept as markup and drawn as an image.
+                if name == "svg" {
+                    if let Target::Node(id) = target
+                        && svg_bytes < MAX_SVG_TOTAL
+                    {
+                        let markup = crate::svg::serialize(node, &mut svg_defs, crate::svg::MAX_SVG_BYTES);
+                        svg_bytes += markup.len();
+                        svg_markup.push((id, markup));
+                    }
+                    continue;
+                }
                 // A closed <details> shows only its summary.
                 let closed_details = name == "details" && e.attr("open").is_none();
                 for child in node.children().rev() {
@@ -366,6 +388,9 @@ pub(crate) fn parse(html: &str, base_url: &Url) -> Parsed {
         }
     }
     dom.base = Arc::new(base);
+    for (id, markup) in svg_markup {
+        dom.svgs.insert(id, crate::svg::with_page_defs(markup, &svg_defs));
+    }
     Parsed { dom, title, sheets, images, stylesheet_urls }
 }
 

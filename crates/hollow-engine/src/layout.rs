@@ -27,7 +27,7 @@ mod flex;
 mod position;
 mod table;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -170,6 +170,9 @@ struct ImageSize {
     attr_w: Option<f32>,
     attr_h: Option<f32>,
     intrinsic: Option<(f32, f32)>,
+    /// `intrinsic` is only a shape: an SVG with a `viewBox` but no size of
+    /// its own, which takes the room it is given.
+    ratio_only: bool,
 }
 
 impl ImageSize {
@@ -192,7 +195,14 @@ impl ImageSize {
             (Some(w), Some(h)) if matches!(self.height, Len::Px(_)) => (w, h),
             (Some(w), _) => (w, ratio.map(|r| w / r).or(height).unwrap_or(w)),
             (None, Some(h)) => (ratio.map(|r| h * r).or(self.attr_w).or(self.intrinsic.map(|i| i.0)).unwrap_or(h), h),
-            (None, None) => self.intrinsic.unwrap_or((0.0, 0.0)),
+            (None, None) => match self.intrinsic {
+                // CSS's default object size is 300 px wide.
+                Some((iw, ih)) if self.ratio_only && iw > 0.0 => {
+                    let w = if avail.is_finite() { avail } else { 300.0 };
+                    (w, w * ih / iw)
+                }
+                other => other.unwrap_or((0.0, 0.0)),
+            },
         };
         if let Some(max) = self.max_width.filter(|m| usable(*m)).map(|m| m.resolve(avail))
             && w > max
@@ -216,7 +226,7 @@ fn clamp_extent(v: f32) -> f32 {
 /// Elements drawn by the engine itself rather than from their children
 /// (`<object>` too, when it shows an image).
 fn is_replaced(name: &str) -> bool {
-    matches!(name, "img" | "input" | "textarea" | "select")
+    matches!(name, "img" | "input" | "textarea" | "select" | "svg")
 }
 
 /// Whether border side `i` meets a visible neighbour of another color.
@@ -274,6 +284,8 @@ struct Builder<'a> {
     link_ids: BTreeMap<NodeId, u32>,
     images: Vec<Arc<Pixmap>>,
     image_ids: BTreeMap<String, u32>,
+    /// Images (SVGs) that have a shape but no size of their own.
+    ratio_only: BTreeSet<u32>,
     /// What is left of the budget for decoding `data:` images.
     data_pixels: u64,
     data_images: usize,
@@ -538,6 +550,7 @@ impl<'a> Builder<'a> {
             attr_w: None,
             attr_h: None,
             intrinsic: Some((p.width() as f32, p.height() as f32)),
+            ratio_only: self.ratio_only.contains(&image),
         };
         self.last_space = false;
         items.push(Item::Image { image: Some(image), size, style, link: ctx.link });
@@ -738,8 +751,12 @@ impl<'a> Builder<'a> {
             Item::Text { text: text.to_owned(), style: node, link: ctx.link, bg }
         };
         match el.name.as_str() {
-            "img" | "object" => {
-                let image = self.dom.nodes[node].url.as_ref().and_then(|u| self.image_id(u));
+            "img" | "object" | "svg" => {
+                let image = if el.name == "svg" {
+                    self.svg_image(node, st.color)
+                } else {
+                    self.dom.nodes[node].url.as_ref().and_then(|u| self.image_id(u))
+                };
                 let attr = |n: &str| el.attr(n).and_then(crate::style::dimension_px);
                 let size = ImageSize {
                     width: st.width,
@@ -751,6 +768,7 @@ impl<'a> Builder<'a> {
                         let p = &self.images[i as usize];
                         (p.width() as f32, p.height() as f32)
                     }),
+                    ratio_only: image.is_some_and(|i| self.ratio_only.contains(&i)),
                 };
                 let sized = (size.attr_h.is_some() || matches!(size.height, Len::Px(_)))
                     && (st.width.is_definite() || size.attr_w.is_some());
@@ -870,27 +888,63 @@ impl<'a> Builder<'a> {
         if let Some(&id) = self.image_ids.get(url.as_str()) {
             return Some(id);
         }
-        let pixmap = if url.scheme() == "data" { self.data_image(url)? } else { self.resources.get(url)? };
+        let (pixmap, ratio_only) = if url.scheme() == "data" {
+            self.data_image(url)?
+        } else {
+            (self.resources.get(url)?, self.resources.ratio_only(url))
+        };
         let id = self.images.len() as u32;
+        if ratio_only {
+            self.ratio_only.insert(id);
+        }
         self.images.push(pixmap);
         self.image_ids.insert(url.as_str().to_owned(), id);
         Some(id)
     }
 
-    /// Decodes a `data:` image, within the document's budget for them.
-    fn data_image(&mut self, url: &Url) -> Option<Arc<Pixmap>> {
+    /// An inline `<svg>`, drawn in the element's text color where it says
+    /// `currentColor`, within the same budget as `data:` images.
+    fn svg_image(&mut self, node: NodeId, color: Color) -> Option<u32> {
+        let markup = self.dom.svgs.get(&node)?;
+        let key = format!("svg:{node}:{:02x}{:02x}{:02x}", color.r, color.g, color.b);
+        if let Some(&id) = self.image_ids.get(&key) {
+            return Some(id);
+        }
         if self.data_images >= MAX_DATA_IMAGES {
             return None;
         }
         self.data_images += 1;
-        let (_, bytes) = crate::data_url::decode(url.as_str())?;
-        let pixmap = crate::image::decode(&bytes).ok()?;
+        let hex = format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b);
+        let markup = markup.replace("currentColor", &hex).replace("currentcolor", &hex);
+        let (pixmap, ratio_only) = crate::svg::render_sized(markup.as_bytes()).ok()?;
         let pixels = u64::from(pixmap.width()) * u64::from(pixmap.height());
         if pixels > self.data_pixels {
             return None;
         }
         self.data_pixels -= pixels;
-        Some(Arc::new(pixmap))
+        let id = self.images.len() as u32;
+        if ratio_only {
+            self.ratio_only.insert(id);
+        }
+        self.images.push(Arc::new(pixmap));
+        self.image_ids.insert(key, id);
+        Some(id)
+    }
+
+    /// Decodes a `data:` image, within the document's budget for them.
+    fn data_image(&mut self, url: &Url) -> Option<(Arc<Pixmap>, bool)> {
+        if self.data_images >= MAX_DATA_IMAGES {
+            return None;
+        }
+        self.data_images += 1;
+        let (_, bytes) = crate::data_url::decode(url.as_str())?;
+        let (pixmap, ratio_only) = crate::image::decode_sized(&bytes).ok()?;
+        let pixels = u64::from(pixmap.width()) * u64::from(pixmap.height());
+        if pixels > self.data_pixels {
+            return None;
+        }
+        self.data_pixels -= pixels;
+        Some((Arc::new(pixmap), ratio_only))
     }
 }
 
@@ -1416,6 +1470,7 @@ pub(crate) fn layout(dom: &Dom, styles: &Styles, generated: &Generated, resource
         link_ids: BTreeMap::new(),
         images: Vec::new(),
         image_ids: BTreeMap::new(),
+        ratio_only: BTreeSet::new(),
         data_pixels: MAX_DATA_PIXELS,
         data_images: 0,
         last_space: true,
@@ -3017,6 +3072,7 @@ mod tests {
             attr_w: None,
             attr_h: None,
             intrinsic: Some((400.0, 200.0)),
+            ratio_only: false,
         };
         assert_eq!(s.resolve(1000.0), (400.0, 200.0));
         assert_eq!(s.resolve(100.0), (100.0, 50.0));

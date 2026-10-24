@@ -17,7 +17,7 @@ const MAX_IMAGE_SIDE: u32 = 16_384;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ImageError {
-    /// Not PNG, JPEG, GIF or WebP.
+    /// Not PNG, JPEG, GIF, WebP or SVG.
     Unsupported,
     /// Corrupt or truncated data.
     Decode,
@@ -50,8 +50,12 @@ fn check_size(w: u32, h: u32) -> Result<(), ImageError> {
     Ok(())
 }
 
-/// Decodes to a premultiplied RGBA pixmap.
-pub(crate) fn decode(bytes: &[u8]) -> Result<Pixmap, ImageError> {
+/// Decodes to a premultiplied RGBA pixmap, also saying whether the image
+/// has only a shape and no size of its own (an SVG with just a `viewBox`).
+pub(crate) fn decode_sized(bytes: &[u8]) -> Result<(Pixmap, bool), ImageError> {
+    if crate::svg::looks_like_svg(bytes) {
+        return crate::svg::render_sized(bytes);
+    }
     let (w, h, rgba) = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         decode_png(bytes)?
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
@@ -63,7 +67,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Pixmap, ImageError> {
     } else {
         return Err(ImageError::Unsupported);
     };
-    to_pixmap(w, h, rgba)
+    to_pixmap(w, h, rgba).map(|p| (p, false))
 }
 
 fn to_pixmap(w: u32, h: u32, mut rgba: Vec<u8>) -> Result<Pixmap, ImageError> {
@@ -199,6 +203,10 @@ fn decode_webp(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), ImageError> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn decode(bytes: &[u8]) -> Result<Pixmap, ImageError> {
+        decode_sized(bytes).map(|(p, _)| p)
+    }
 
     /// Encodes a solid-color RGBA PNG for tests.
     pub(crate) fn png(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {

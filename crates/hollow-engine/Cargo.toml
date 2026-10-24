@@ -17,6 +17,7 @@ harfrust = "0.15.0"
 html5ever = "0.40.1"
 image-webp = "0.2.4"
 png = "0.18.1"
+resvg = { version = "0.49.0", default-features = false, features = ["text"] }
 scraper = "0.29.0"
 skrifa = "0.49.0"
 tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"] }

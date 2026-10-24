@@ -1075,3 +1075,14 @@ fn inline_buttons_and_submit_inputs_are_controls() {
     assert!(hits[20], "the button's label is clickable");
     assert!(hits.iter().skip(80).any(|h| *h), "the submit input is clickable");
 }
+
+#[test]
+fn inline_svg_icons_use_page_symbols_and_current_color() {
+    let html = format!(
+        "{PLAIN}<svg style='display:none'><symbol id=box viewBox='0 0 10 10'>\
+         <rect width='10' height='10' fill='currentColor'/></symbol></svg>\
+         <div style='color:#0000ff'><svg width=20 height=20><use href='#box'/></svg></div>"
+    );
+    let f = layout(&html, 100.0).paint(0.0, 40.0, 1.0);
+    assert_eq!(pixel(&f, 10, 10), [0, 0, 255, 255], "the symbol from the hidden sprite, in the text color");
+}
