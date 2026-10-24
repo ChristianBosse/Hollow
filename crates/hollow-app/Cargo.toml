@@ -15,10 +15,12 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+form_urlencoded = "1.2.2"
 hollow-engine.workspace = true
 hollow-ipc.workspace = true
 hollow-sandbox.workspace = true
 png = { version = "0.18.1", optional = true }
+psl = "2.1.245"
 serde = "1.0.229"
 softbuffer = "0.4"
 thiserror = "2.0.21"

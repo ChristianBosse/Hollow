@@ -1,11 +1,16 @@
-//! The navigator thread. It owns the network process and the current page's
-//! renderer, so the window thread never waits on either.
+//! One navigator thread per tab. It owns that tab's renderer and shares the
+//! network process with the other tabs, so the window thread never waits on
+//! either and a slow page in one tab doesn't hold up the rest.
 //!
 //! One renderer per page: navigating kills the old renderer process and
 //! starts a fresh one (SEC-03). Subresources are fetched by the broker, on
-//! the circuit of the page in the address bar (first-party isolation).
+//! the circuit of the page in the address bar (first-party isolation). A
+//! background tab can be suspended: its renderer is killed and the page's
+//! bytes stay in the broker's memory, so switching back re-renders without
+//! touching the network.
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use anyhow::{Context, bail};
@@ -14,22 +19,48 @@ use url::Url;
 use winit::event_loop::EventLoopProxy;
 
 use crate::child::{Child, Kind};
-use crate::net::{Ledger, Net};
+use crate::net::{self, Ledger, Navigation, Net};
 use crate::policy;
 use crate::terminal::sanitize;
 
 pub const START_URL: &str = "about:hollow";
 
+pub type TabId = u64;
+
 #[derive(Debug)]
 pub enum Command {
-    Navigate { url: Url, from_history: bool },
-    Paint { scroll_y: f32, viewport: Viewport },
-    Click { x: f32, y: f32 },
+    Navigate {
+        url: Url,
+        from_history: bool,
+        referrer: Option<Url>,
+    },
+    Paint {
+        scroll_y: f32,
+        viewport: Viewport,
+    },
+    /// A click at page coordinates; `new_tab` for middle and Ctrl+click.
+    Click {
+        x: f32,
+        y: f32,
+        new_tab: bool,
+    },
+    /// Kill the renderer but keep the page, for tabs out of sight.
+    Suspend,
     Shutdown,
 }
 
 #[derive(Debug)]
 pub enum UiEvent {
+    Tab(TabId, TabEvent),
+    /// Tor's own status, for every tab.
+    NetStatus(String),
+    /// A scripted step (development builds with `dev-dump` only).
+    #[cfg(feature = "dev-dump")]
+    Dev(super::dev_dump::Step),
+}
+
+#[derive(Debug)]
+pub enum TabEvent {
     Status(String),
     /// A navigation committed to this URL (after redirects).
     Loading {
@@ -38,55 +69,118 @@ pub enum UiEvent {
     },
     Title(Option<String>),
     Frame(Frame),
-    /// A scripted step (development builds with `dev-dump` only).
-    #[cfg(feature = "dev-dump")]
-    Dev(super::dev_dump::Step),
+    /// A navigation ended, shown or failed.
+    Finished,
+    /// A link the user wants in a new tab.
+    OpenInNewTab {
+        url: Url,
+        referrer: Url,
+    },
 }
 
-pub fn spawn(proxy: EventLoopProxy<UiEvent>, viewport: Viewport) -> (Sender<Command>, JoinHandle<()>) {
+/// The network process, once Tor is up, shared by all tabs.
+#[derive(Clone)]
+pub struct NetSlot(Arc<(Mutex<NetState>, Condvar)>);
+
+enum NetState {
+    Starting,
+    Ready(Net),
+    Failed(String),
+    Stopped,
+}
+
+impl NetSlot {
+    /// Starts Tor on its own thread. The start page needs no network, so
+    /// the window shows it while Tor bootstraps.
+    pub fn start(proxy: EventLoopProxy<UiEvent>) -> NetSlot {
+        let slot = NetSlot(Arc::new((Mutex::new(NetState::Starting), Condvar::new())));
+        let ours = slot.clone();
+        std::thread::spawn(move || {
+            let _ = proxy.send_event(UiEvent::NetStatus("Starting Tor: every session starts fresh, in RAM…".into()));
+            let progress = proxy.clone();
+            let result = Net::start(Box::new(move |p| {
+                let _ = progress.send_event(UiEvent::NetStatus(format!("Tor: {p}")));
+            }));
+            let status = match &result {
+                Ok(_) => "Connected to Tor · Fortress mode: no JavaScript · nothing is written to disk".to_owned(),
+                Err(e) => format!("Tor failed to start: {e:#}"),
+            };
+            let (lock, cvar) = &*ours.0;
+            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+            match (&*state, result) {
+                // The window closed while Tor was starting.
+                (NetState::Stopped, Ok(net)) => net.shutdown(),
+                (NetState::Stopped, Err(_)) => {}
+                (_, Ok(net)) => *state = NetState::Ready(net),
+                (_, Err(e)) => *state = NetState::Failed(format!("{e:#}")),
+            }
+            cvar.notify_all();
+            drop(state);
+            let _ = proxy.send_event(UiEvent::NetStatus(sanitize(&status)));
+        });
+        slot
+    }
+
+    /// The network, waiting for Tor if it's still starting.
+    fn wait(&self) -> anyhow::Result<Net> {
+        let (lock, cvar) = &*self.0;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while matches!(*state, NetState::Starting) {
+            state = cvar.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        match &*state {
+            NetState::Ready(net) => Ok(net.clone()),
+            NetState::Failed(e) => bail!("Tor isn't running: {e}"),
+            NetState::Starting | NetState::Stopped => bail!("Tor isn't running"),
+        }
+    }
+
+    pub fn is_starting(&self) -> bool {
+        matches!(*self.0.0.lock().unwrap_or_else(|e| e.into_inner()), NetState::Starting)
+    }
+
+    pub fn shutdown(&self) {
+        let (lock, cvar) = &*self.0;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let NetState::Ready(net) = std::mem::replace(&mut *state, NetState::Stopped) {
+            net.shutdown();
+        }
+        cvar.notify_all();
+    }
+}
+
+pub fn spawn(
+    id: TabId,
+    proxy: EventLoopProxy<UiEvent>,
+    net: NetSlot,
+    viewport: Viewport,
+) -> (Sender<Command>, JoinHandle<()>) {
     let (tx, rx) = std::sync::mpsc::channel();
-    let handle = std::thread::spawn(move || Navigator { proxy, viewport, net: None, page: None }.run(rx));
+    let handle = std::thread::spawn(move || Navigator { id, proxy, viewport, net, renderer: None, page: None }.run(rx));
     (tx, handle)
 }
 
-struct Page {
-    renderer: Child,
+/// Everything needed to show a page again without the network.
+struct PageData {
+    url: Url,
+    content_type: Option<String>,
+    body: Vec<u8>,
+    images: Vec<(String, Vec<u8>)>,
+    stylesheets: Vec<(String, String)>,
 }
 
 struct Navigator {
+    id: TabId,
     proxy: EventLoopProxy<UiEvent>,
     viewport: Viewport,
-    net: Option<Net>,
-    page: Option<Page>,
+    net: NetSlot,
+    renderer: Option<Child>,
+    page: Option<PageData>,
 }
 
 impl Navigator {
     fn run(mut self, rx: Receiver<Command>) {
-        // The start page needs no network: show it before Tor bootstraps.
         let mut pending = None;
-        if let Ok(cmd) = rx.recv_timeout(std::time::Duration::from_millis(500)) {
-            match cmd {
-                Command::Navigate { url, from_history } if url.as_str() == START_URL => {
-                    if let Err(e) = self.navigate(url, from_history) {
-                        self.status(&format!("{e:#}"));
-                    }
-                }
-                other => pending = Some(other),
-            }
-        }
-
-        self.status("Starting Tor: every session starts fresh, in RAM…");
-        let proxy = self.proxy.clone();
-        match Net::start(Box::new(move |p| {
-            let _ = proxy.send_event(UiEvent::Status(format!("Tor: {p}")));
-        })) {
-            Ok(net) => {
-                self.net = Some(net);
-                self.status("Connected to Tor · Fortress mode: no JavaScript · nothing is written to disk");
-            }
-            Err(e) => self.status(&format!("Tor failed to start: {e:#}")),
-        }
-
         loop {
             let cmd = match pending.take() {
                 Some(c) => c,
@@ -96,7 +190,11 @@ impl Navigator {
                 },
             };
             let result = match cmd {
-                Command::Navigate { url, from_history } => self.navigate(url, from_history),
+                Command::Navigate { url, from_history, referrer } => {
+                    let r = self.navigate(Navigation { url, referrer: referrer.as_ref(), post: None }, from_history);
+                    self.send(TabEvent::Finished);
+                    r
+                }
                 Command::Paint { mut scroll_y, mut viewport } => {
                     // Scrolling sends bursts; only the latest position matters.
                     loop {
@@ -112,60 +210,100 @@ impl Navigator {
                     self.viewport = viewport;
                     self.paint(scroll_y)
                 }
-                Command::Click { x, y } => self.click(x, y),
+                Command::Click { x, y, new_tab } => self.click(x, y, new_tab),
+                Command::Suspend => {
+                    self.renderer = None;
+                    Ok(())
+                }
                 Command::Shutdown => break,
             };
             if let Err(e) = result {
                 self.status(&format!("{e:#}"));
             }
         }
-        self.page = None;
-        if let Some(net) = self.net.take() {
-            net.shutdown();
-        }
+    }
+
+    fn send(&self, event: TabEvent) {
+        let _ = self.proxy.send_event(UiEvent::Tab(self.id, event));
     }
 
     fn status(&self, s: &str) {
-        let _ = self.proxy.send_event(UiEvent::Status(sanitize(s)));
+        self.send(TabEvent::Status(sanitize(s)));
     }
 
-    fn navigate(&mut self, url: Url, from_history: bool) -> anyhow::Result<()> {
+    fn navigate(&mut self, nav: Navigation, from_history: bool) -> anyhow::Result<()> {
         // The old page's renderer dies here; the new page gets a fresh one.
+        self.renderer = None;
         self.page = None;
+        let url = nav.url.clone();
         let (url, content_type, body) = if url.as_str() == START_URL {
             (url, Some("text/html".to_owned()), START_PAGE.as_bytes().to_vec())
         } else {
             policy::check(&url)?;
+            if self.net.is_starting() {
+                self.status(&format!("Waiting for Tor before loading {url} …"));
+            }
+            let net = self.net.wait()?;
             self.status(&format!("Loading {url} …"));
-            let net = self.net.as_mut().context("Tor isn't running")?;
-            match net.fetch_page(url.clone(), &mut |_| {}) {
-                Ok((final_url, resp)) => (final_url, resp.header("content-type").map(str::to_owned), resp.body),
+            match net.fetch_page(nav, &mut |_| {}) {
+                Ok((final_url, resp)) => match net::onion_location(&final_url, &resp) {
+                    // The site has an onion service: use it (NET-09). If it
+                    // fails, the HTTPS page we already have is shown.
+                    Some(onion) => {
+                        self.status(&format!("This site has an onion service; loading {onion} …"));
+                        let nav = Navigation { url: onion, referrer: None, post: None };
+                        match net.fetch_page(nav, &mut |_| {}) {
+                            Ok((u, r)) => (u, r.header("content-type").map(str::to_owned), r.body),
+                            Err(_) => (final_url, resp.header("content-type").map(str::to_owned), resp.body),
+                        }
+                    }
+                    None => (final_url, resp.header("content-type").map(str::to_owned), resp.body),
+                },
                 Err(e) => (url, Some("text/html".to_owned()), error_page(&format!("{e:#}")).into_bytes()),
             }
         };
-        let _ = self.proxy.send_event(UiEvent::Loading { url: url.clone(), from_history });
+        self.send(TabEvent::Loading { url: url.clone(), from_history });
+        let page = PageData { url, content_type, body, images: vec![], stylesheets: vec![] };
+        self.show(page, true)
+    }
 
+    /// Starts a renderer for `page` and paints it at the top. With `fetch`,
+    /// what the renderer asks for is fetched and remembered; without, the
+    /// remembered resources are handed over again.
+    fn show(&mut self, mut page: PageData, fetch: bool) -> anyhow::Result<()> {
+        self.renderer = None;
         let mut renderer = Child::spawn(Kind::Fortress)?;
-        renderer.send(&BrokerToRenderer::Load { url: url.to_string(), content_type, body, viewport: self.viewport })?;
+        renderer.send(&BrokerToRenderer::Load {
+            url: page.url.to_string(),
+            content_type: page.content_type.clone(),
+            body: page.body.clone(),
+            viewport: self.viewport,
+        })?;
         match renderer.recv::<RendererToBroker>()? {
-            RendererToBroker::Loaded { title } => {
-                let _ = self.proxy.send_event(UiEvent::Title(title.map(|t| sanitize(&t))));
-            }
+            RendererToBroker::Loaded { title } => self.send(TabEvent::Title(title.map(|t| sanitize(&t)))),
             other => bail!("unexpected reply from renderer: {}", short(&other)),
         }
         let (want_images, want_sheets) = match renderer.recv::<RendererToBroker>()? {
             RendererToBroker::NeedResources { images, stylesheets } => (images, stylesheets),
             other => bail!("unexpected reply from renderer: {}", short(&other)),
         };
-        let fetched = self.fetch_resources(&url, &want_images, &want_sheets)?;
-        let summary = fetched.summary(want_images.len(), want_sheets.len());
-        renderer.send(&BrokerToRenderer::Resources { images: fetched.images, stylesheets: fetched.stylesheets })?;
-        let frame = expect_frame(&mut renderer)?;
-        let _ = self.proxy.send_event(UiEvent::Frame(frame));
-        self.page = Some(Page { renderer });
-        if url.as_str() != START_URL {
-            self.status(&format!("Done{summary} · circuit: {}", policy::isolation_key(&url)));
+        let mut summary = None;
+        if fetch {
+            let fetched = self.fetch_resources(&page.url, &want_images, &want_sheets)?;
+            summary = Some(fetched.summary(want_images.len(), want_sheets.len()));
+            (page.images, page.stylesheets) = (fetched.images, fetched.stylesheets);
         }
+        renderer.send(&BrokerToRenderer::Resources {
+            images: page.images.clone(),
+            stylesheets: page.stylesheets.clone(),
+        })?;
+        let frame = expect_frame(&mut renderer)?;
+        self.send(TabEvent::Frame(frame));
+        self.renderer = Some(renderer);
+        if let Some(summary) = summary.filter(|_| page.url.as_str() != START_URL) {
+            self.status(&format!("Done{summary} · circuit: {}", policy::isolation_key(&page.url)));
+        }
+        self.page = Some(page);
         Ok(())
     }
 
@@ -178,14 +316,14 @@ impl Navigator {
         };
         let (image_urls, sheet_urls) = (allowed(images), allowed(sheets));
         let mut fetched = Fetched::default();
-        if page.as_str() == START_URL || self.net.is_none() || image_urls.len() + sheet_urls.len() == 0 {
+        if page.as_str() == START_URL || image_urls.len() + sheet_urls.len() == 0 {
             return Ok(fetched);
         }
+        let Ok(net) = self.net.wait() else { return Ok(fetched) };
         self.status(&format!("Loading {} images and {} stylesheets…", image_urls.len(), sheet_urls.len()));
-        let Some(net) = self.net.as_mut() else { return Ok(fetched) };
         let all: Vec<Url> = image_urls.iter().chain(&sheet_urls).cloned().collect();
         // Failures go to stderr for developers; the status bar shows counts.
-        let responses = net.fetch_subresources(&all, &policy::isolation_key(page), &mut |event| {
+        let responses = net.fetch_subresources(&all, page, &mut |event| {
             if let Ledger::Failed { url, reason } = event {
                 eprintln!("hollow: {url} failed: {reason}");
             }
@@ -204,30 +342,45 @@ impl Navigator {
         Ok(fetched)
     }
 
+    /// The renderer, restarted from the remembered page if it was suspended.
+    fn renderer(&mut self) -> anyhow::Result<Option<&mut Child>> {
+        if self.renderer.is_none()
+            && let Some(page) = self.page.take()
+        {
+            self.show(page, false)?;
+        }
+        Ok(self.renderer.as_mut())
+    }
+
     fn paint(&mut self, scroll_y: f32) -> anyhow::Result<()> {
-        let Some(page) = self.page.as_mut() else { return Ok(()) };
-        page.renderer.send(&BrokerToRenderer::Paint { scroll_y, viewport: self.viewport })?;
-        let frame = expect_frame(&mut page.renderer)?;
-        let _ = self.proxy.send_event(UiEvent::Frame(frame));
+        let viewport = self.viewport;
+        let Some(renderer) = self.renderer()? else { return Ok(()) };
+        renderer.send(&BrokerToRenderer::Paint { scroll_y, viewport })?;
+        let frame = expect_frame(renderer)?;
+        self.send(TabEvent::Frame(frame));
         Ok(())
     }
 
-    fn click(&mut self, x: f32, y: f32) -> anyhow::Result<()> {
-        let Some(page) = self.page.as_mut() else { return Ok(()) };
-        page.renderer.send(&BrokerToRenderer::HitTest { x, y })?;
-        let link = match page.renderer.recv::<RendererToBroker>()? {
+    fn click(&mut self, x: f32, y: f32, new_tab: bool) -> anyhow::Result<()> {
+        let Some(renderer) = self.renderer()? else { return Ok(()) };
+        renderer.send(&BrokerToRenderer::HitTest { x, y })?;
+        let link = match renderer.recv::<RendererToBroker>()? {
             RendererToBroker::Hit(link) => link,
             other => bail!("unexpected reply from renderer: {}", short(&other)),
         };
         let Some(link) = link else { return Ok(()) };
         // What the renderer says is a link is just a suggestion.
         let url = Url::parse(&link).with_context(|| format!("bad link {}", sanitize(&link)))?;
-        match policy::check(&url) {
-            Ok(()) => self.navigate(url, false),
-            Err(e) => {
-                self.status(&format!("Blocked {}: {e}", sanitize(url.as_str())));
-                Ok(())
-            }
+        if let Err(e) = policy::check(&url) {
+            self.status(&format!("Blocked {}: {e}", sanitize(url.as_str())));
+            return Ok(());
+        }
+        let Some(current) = self.page.as_ref().map(|p| p.url.clone()) else { return Ok(()) };
+        if new_tab {
+            self.send(TabEvent::OpenInNewTab { url, referrer: current });
+            Ok(())
+        } else {
+            self.navigate(Navigation { url, referrer: Some(&current), post: None }, false)
         }
     }
 }
@@ -308,7 +461,8 @@ const START_PAGE: &str = r#"<html><head><title>Hollow</title></head>
 </ul>
 <h2>Keys</h2>
 <ul>
-<li><b>Ctrl+L</b>: address bar &nbsp; <b>Enter</b>: go &nbsp; <b>Esc</b>: cancel</li>
+<li><b>Ctrl+L</b>: address bar &nbsp; <b>Enter</b>: go &nbsp; <b>Esc</b>: cancel. Words instead of an address search DuckDuckGo's onion service.</li>
+<li><b>Ctrl+T</b>: new tab &nbsp; <b>Ctrl+W</b>: close tab &nbsp; <b>Ctrl+Tab</b>: next tab &nbsp; <b>Middle click</b> or <b>Ctrl+click</b>: open a link in a new tab</li>
 <li><b>Alt+Left / Alt+Right</b>: back / forward</li>
 <li><b>Mouse wheel, Page Up/Down, Space</b>: scroll</li>
 </ul>

@@ -6,7 +6,7 @@ use hollow_ipc::{BrokerToRenderer, RendererToBroker};
 use url::Url;
 
 use crate::child::{Child, Kind};
-use crate::net::{Ledger, Net};
+use crate::net::{Ledger, Navigation, Net};
 use crate::policy;
 use crate::terminal::sanitize;
 
@@ -16,9 +16,9 @@ pub fn run(input: &str) -> anyhow::Result<bool> {
     let url = policy::parse_input(input)?;
 
     eprintln!("Starting Tor (every session starts fresh, in RAM; this takes a few seconds)...");
-    let mut net = Net::start(Box::new(|p| eprintln!("   Tor: {p}")))?;
+    let net = Net::start(Box::new(|p| eprintln!("   Tor: {p}")))?;
     eprintln!("   Tor: ready");
-    let (url, response) = net.fetch_page(url, &mut print_ledger)?;
+    let (url, response) = net.fetch_page(Navigation { url, referrer: None, post: None }, &mut print_ledger)?;
     net.shutdown();
 
     // A fresh renderer for this page, discarded afterwards (SEC-03).

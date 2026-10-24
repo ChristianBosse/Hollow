@@ -3,6 +3,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -74,10 +75,23 @@ pub enum Variant {
 }
 
 pub struct Child {
+    tx: ChildSender,
+    rx: ChildReceiver,
+}
+
+/// The broker-to-child direction, which can live on another thread than the
+/// reader (see [`Child::split`]).
+pub struct ChildSender {
     kind: Kind,
-    process: SandboxedProcess,
-    rx: BufReader<File>,
+    process: Arc<SandboxedProcess>,
     tx: BufWriter<File>,
+}
+
+/// The child-to-broker direction.
+pub struct ChildReceiver {
+    kind: Kind,
+    process: Arc<SandboxedProcess>,
+    rx: BufReader<File>,
     stderr: Option<JoinHandle<()>>,
 }
 
@@ -116,15 +130,50 @@ impl Child {
         let stderr = forward_stderr(kind.label(), process.stderr.take().expect("stderr pipe is set by spawn"));
         let rx = BufReader::new(process.stdout.take().expect("stdout pipe is set by spawn"));
         let tx = BufWriter::new(process.stdin.take().expect("stdin pipe is set by spawn"));
-        Ok(Self { kind, process, rx, tx, stderr: Some(stderr) })
+        let process = Arc::new(process);
+        Ok(Self {
+            tx: ChildSender { kind, process: Arc::clone(&process), tx },
+            rx: ChildReceiver { kind, process, rx, stderr: Some(stderr) },
+        })
     }
 
     pub fn send<T: Serialize>(&mut self, msg: &T) -> anyhow::Result<()> {
-        write_frame(&mut self.tx, msg).with_context(|| format!("sending to {}", self.kind.exe_name()))
+        self.tx.send(msg)
     }
 
     /// Receives and validates the next message. A child that closes its pipe
     /// or sends something invalid is treated as failed.
+    pub fn recv<T: DeserializeOwned + Validate>(&mut self) -> anyhow::Result<T> {
+        self.rx.recv()
+    }
+
+    /// Asks the child to exit, then kills it if it doesn't.
+    pub fn shutdown<T: Serialize>(self, msg: &T) {
+        self.tx.shutdown(msg);
+    }
+
+    /// Separates the two directions so one thread can block reading while
+    /// others send.
+    pub fn split(self) -> (ChildSender, ChildReceiver) {
+        (self.tx, self.rx)
+    }
+}
+
+impl ChildSender {
+    pub fn send<T: Serialize>(&mut self, msg: &T) -> anyhow::Result<()> {
+        write_frame(&mut self.tx, msg).with_context(|| format!("sending to {}", self.kind.exe_name()))
+    }
+
+    /// Asks the child to exit, then kills it if it doesn't.
+    pub fn shutdown<T: Serialize>(mut self, msg: &T) {
+        let _ = self.send(msg);
+        if !matches!(self.process.wait_timeout(Duration::from_secs(3)), Ok(Some(_))) {
+            self.process.kill();
+        }
+    }
+}
+
+impl ChildReceiver {
     pub fn recv<T: DeserializeOwned + Validate>(&mut self) -> anyhow::Result<T> {
         let name = self.kind.exe_name();
         match read_frame::<_, T>(&mut self.rx) {
@@ -144,14 +193,6 @@ impl Child {
                 }
             }
             Err(e) => Err(anyhow!(e).context(format!("reading from {name}"))),
-        }
-    }
-
-    /// Asks the child to exit, then kills it if it doesn't.
-    pub fn shutdown<T: Serialize>(mut self, msg: &T) {
-        let _ = self.send(msg);
-        if !matches!(self.process.wait_timeout(Duration::from_secs(3)), Ok(Some(_))) {
-            self.process.kill();
         }
     }
 }

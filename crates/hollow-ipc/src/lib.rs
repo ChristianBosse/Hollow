@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 pub const MAX_FRAME_LEN: usize = 96 * 1024 * 1024;
 /// Largest response body the network process will hand to the broker.
 pub const MAX_BODY_LEN: usize = 16 * 1024 * 1024;
+/// Largest request body (a form submission) the broker will send.
+pub const MAX_REQUEST_BODY_LEN: usize = 4 * 1024 * 1024;
 
 const MAX_HEADERS: usize = 256;
 const MAX_HEADER_LEN: usize = 16 * 1024;
@@ -96,6 +98,21 @@ pub struct FetchRequest {
     /// First-party site this request belongs to. Each key gets its own Tor
     /// circuit and connection state (NET-05, STATE-03).
     pub isolation_key: String,
+    pub method: Method,
+    /// Request body: form submissions only, empty for `GET`.
+    pub body: Vec<u8>,
+    /// `Content-Type` of `body`.
+    pub content_type: Option<String>,
+    /// Already trimmed by the broker's referrer policy (STATE-05).
+    pub referer: Option<String>,
+    /// `Origin` header: set for form submissions, like other browsers do.
+    pub origin: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Method {
+    Get,
+    Post,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -369,6 +386,11 @@ mod tests {
             path_and_query: "/a?b=c".into(),
             tls: true,
             isolation_key: "example.org".into(),
+            method: Method::Get,
+            body: vec![],
+            content_type: None,
+            referer: None,
+            origin: None,
         });
         write_frame(&mut buf, &msg).unwrap();
         write_frame(&mut buf, &BrokerToNet::Shutdown).unwrap();

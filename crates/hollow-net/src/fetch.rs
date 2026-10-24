@@ -5,10 +5,10 @@ use std::time::Duration;
 use anyhow::{Context, anyhow};
 use arti_client::{IsolationToken, StreamPrefs};
 use bytes::Bytes;
-use hollow_ipc::{FetchRequest, FetchResponse, MAX_BODY_LEN};
-use http_body_util::{BodyExt, Empty, Limited};
+use hollow_ipc::{FetchRequest, FetchResponse, MAX_BODY_LEN, Method};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::Request;
-use hyper::header::{ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, HOST, USER_AGENT};
+use hyper::header::{ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONTENT_TYPE, HOST, ORIGIN, REFERER, USER_AGENT};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
@@ -64,14 +64,14 @@ impl Fetcher {
         if req.tls {
             let name = ServerName::try_from(req.host.clone()).context("invalid server name")?;
             let tls = self.tls.connect(name, stream).await.context("TLS handshake")?;
-            http_get(tls, req).await
+            http_request(tls, req).await
         } else {
-            http_get(stream, req).await
+            http_request(stream, req).await
         }
     }
 }
 
-async fn http_get<S>(io: S, req: &FetchRequest) -> anyhow::Result<FetchResponse>
+async fn http_request<S>(io: S, req: &FetchRequest) -> anyhow::Result<FetchResponse>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -82,14 +82,26 @@ where
 
     let default_port = if req.tls { 443 } else { 80 };
     let host = if req.port == default_port { req.host.clone() } else { format!("{}:{}", req.host, req.port) };
-    let request = Request::get(req.path_and_query.as_str())
+    let builder = match req.method {
+        Method::Get => Request::get(req.path_and_query.as_str()),
+        Method::Post => Request::post(req.path_and_query.as_str()),
+    };
+    let mut builder = builder
         .header(HOST, host)
         .header(USER_AGENT, profile::USER_AGENT)
         .header(ACCEPT, profile::ACCEPT)
         .header(ACCEPT_LANGUAGE, profile::ACCEPT_LANGUAGE)
-        .header(ACCEPT_ENCODING, profile::ACCEPT_ENCODING)
-        .body(Empty::<Bytes>::new())
-        .context("building request")?;
+        .header(ACCEPT_ENCODING, profile::ACCEPT_ENCODING);
+    if let Some(referer) = &req.referer {
+        builder = builder.header(REFERER, referer);
+    }
+    if let Some(origin) = &req.origin {
+        builder = builder.header(ORIGIN, origin);
+    }
+    if let Some(ct) = &req.content_type {
+        builder = builder.header(CONTENT_TYPE, ct);
+    }
+    let request = builder.body(Full::new(Bytes::from(req.body.clone()))).context("building request")?;
 
     let resp = sender.send_request(request).await.context("sending request")?;
     let status = resp.status().as_u16();

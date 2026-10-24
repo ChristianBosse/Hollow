@@ -1,8 +1,9 @@
 //! The browser window (Phase 2).
 //!
 //! The broker owns the window and everything the user types into it. Pages
-//! arrive as finished pixels from a sandboxed renderer (via the navigator
-//! thread); the broker only composes them with its own bars and presents.
+//! arrive as finished pixels from sandboxed renderers (via one navigator
+//! thread per tab); the broker only composes them with its own bars and
+//! presents.
 //!
 //! Privacy details that live here:
 //! - The window is excluded from screen capture and Recall (WIN-01).
@@ -10,7 +11,9 @@
 //!   the taskbar, Alt-Tab or anything else that records window titles.
 //! - The page area snaps to fixed sizes (letterboxing, FP-02), so the
 //!   window size never becomes something a page could measure.
-//! - History lives in RAM only.
+//! - History lives in RAM only, per tab.
+//! - Only the most recently used tabs keep a live renderer; the others are
+//!   suspended and re-rendered from RAM when shown again.
 
 mod chrome;
 mod navigator;
@@ -30,15 +33,18 @@ use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, Window
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{Window, WindowId};
+use winit::window::{Icon, Window, WindowId};
 
 use crate::policy;
-use navigator::{Command, START_URL, UiEvent};
+use navigator::{Command, NetSlot, START_URL, TabEvent, TabId, UiEvent};
 
 /// Letterbox margins.
 const BACKGROUND: u32 = 0x1f1f25;
 /// CSS px scrolled per wheel notch or arrow key.
 const LINE: f32 = 48.0;
+/// Tabs that keep a live renderer process; the rest are suspended.
+const LIVE_RENDERERS: usize = 4;
+const MAX_TABS: usize = 64;
 
 /// Opens the window at `start` (the start page if `None`).
 pub fn run(start: Option<Url>) -> anyhow::Result<bool> {
@@ -58,6 +64,7 @@ struct Geometry {
     scale: f32,
     width: u32,
     height: u32,
+    strip: u32,
     top: u32,
     bottom: u32,
     page_x: u32,
@@ -69,7 +76,8 @@ impl Geometry {
     fn of(window: &Window) -> Geometry {
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
-        let top = (chrome::TOP_BAR * scale).round() as u32;
+        let strip = (chrome::TAB_STRIP * scale).round() as u32;
+        let top = strip + (chrome::TOP_BAR * scale).round() as u32;
         let bottom = (chrome::STATUS_BAR * scale).round() as u32;
         let avail_w = size.width as f32 / scale;
         let avail_h = size.height.saturating_sub(top + bottom) as f32 / scale;
@@ -80,6 +88,7 @@ impl Geometry {
             scale,
             width: size.width,
             height: size.height,
+            strip,
             top,
             bottom,
             page_x: size.width.saturating_sub(page_w) / 2,
@@ -103,27 +112,69 @@ struct AddressBar {
     selected: bool,
 }
 
-struct App {
-    proxy: EventLoopProxy<UiEvent>,
-    window: Option<Rc<Window>>,
-    surface: Option<Surface<Rc<Window>, Rc<Window>>>,
-    nav: Option<(Sender<Command>, JoinHandle<()>)>,
-    fatal: Option<anyhow::Error>,
-    start: Option<Url>,
-
+/// What the window knows about one tab; the page itself lives in the tab's
+/// navigator thread and renderer.
+struct Tab {
+    id: TabId,
+    nav: Sender<Command>,
+    thread: JoinHandle<()>,
     url: Option<Url>,
     title: Option<String>,
     status: String,
+    loading: bool,
     frame: Option<Frame>,
     scroll_y: f32,
     page_height: f32,
     history: Vec<Url>,
     history_pos: usize,
+    /// Larger is more recent; decides which renderers stay alive.
+    last_shown: u64,
+    live: bool,
+}
+
+impl Tab {
+    fn send(&self, cmd: Command) {
+        let _ = self.nav.send(cmd);
+    }
+
+    fn label(&self) -> String {
+        match (&self.title, &self.url) {
+            (Some(t), _) if !t.trim().is_empty() => t.clone(),
+            (_, Some(u)) if u.as_str() == START_URL => "Hollow".into(),
+            (_, Some(u)) => u.host_str().unwrap_or(u.as_str()).to_owned(),
+            (_, None) => "New tab".into(),
+        }
+    }
+}
+
+struct App {
+    proxy: EventLoopProxy<UiEvent>,
+    window: Option<Rc<Window>>,
+    surface: Option<Surface<Rc<Window>, Rc<Window>>>,
+    net: Option<NetSlot>,
+    fatal: Option<anyhow::Error>,
+    start: Option<Url>,
+
+    tabs: Vec<Tab>,
+    active: usize,
+    next_id: TabId,
+    clock: u64,
+    net_status: String,
 
     address: AddressBar,
     modifiers: ModifiersState,
     cursor: PhysicalPosition<f64>,
-    bars: Option<(String, chrome::Bar, String, chrome::Bar)>,
+    bars: Option<Bars>,
+}
+
+/// The rendered bars and what they were rendered from.
+struct Bars {
+    strip_key: String,
+    strip: chrome::Bar,
+    top_key: String,
+    top: chrome::Bar,
+    bottom_key: String,
+    bottom: chrome::Bar,
 }
 
 impl App {
@@ -132,17 +183,14 @@ impl App {
             proxy,
             window: None,
             surface: None,
-            nav: None,
+            net: None,
             fatal: None,
             start: None,
-            url: None,
-            title: None,
-            status: String::new(),
-            frame: None,
-            scroll_y: 0.0,
-            page_height: 0.0,
-            history: Vec::new(),
-            history_pos: 0,
+            tabs: Vec::new(),
+            active: 0,
+            next_id: 1,
+            clock: 0,
+            net_status: String::new(),
             address: AddressBar::default(),
             modifiers: ModifiersState::empty(),
             cursor: PhysicalPosition::new(0.0, 0.0),
@@ -150,10 +198,16 @@ impl App {
         }
     }
 
-    fn send(&self, cmd: Command) {
-        if let Some((tx, _)) = &self.nav {
-            let _ = tx.send(cmd);
-        }
+    fn tab(&self) -> Option<&Tab> {
+        self.tabs.get(self.active)
+    }
+
+    fn tab_mut(&mut self) -> Option<&mut Tab> {
+        self.tabs.get_mut(self.active)
+    }
+
+    fn viewport(&self) -> Option<Viewport> {
+        self.window.as_ref().map(|w| Geometry::of(w).viewport)
     }
 
     fn redraw_later(&self) {
@@ -162,10 +216,109 @@ impl App {
         }
     }
 
-    fn navigate(&mut self, url: Url, from_history: bool) {
-        self.status = format!("Loading {url} …");
-        self.send(Command::Navigate { url, from_history });
+    /// Opens a tab at `url`, in front or behind the current one.
+    fn open_tab(&mut self, url: Url, referrer: Option<Url>, activate: bool) {
+        let (Some(viewport), Some(net)) = (self.viewport(), self.net.clone()) else { return };
+        if self.tabs.len() >= MAX_TABS {
+            if let Some(t) = self.tab_mut() {
+                t.status = format!("At most {MAX_TABS} tabs; close some first");
+            }
+            return;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let (nav, thread) = navigator::spawn(id, self.proxy.clone(), net, viewport);
+        let tab = Tab {
+            id,
+            nav,
+            thread,
+            url: None,
+            title: None,
+            status: String::new(),
+            loading: false,
+            frame: None,
+            scroll_y: 0.0,
+            page_height: 0.0,
+            history: Vec::new(),
+            history_pos: 0,
+            last_shown: 0,
+            live: true,
+        };
+        // New tabs open next to the current one, like other browsers.
+        let at = if self.tabs.is_empty() { 0 } else { self.active + 1 };
+        self.tabs.insert(at, tab);
+        if activate || self.tabs.len() == 1 {
+            self.activate(at);
+        } else if at <= self.active {
+            self.active += 1;
+        }
+        self.navigate_tab(at, url, false, referrer);
+    }
+
+    fn activate(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.active = index;
+        self.clock += 1;
+        let clock = self.clock;
+        let viewport = self.viewport();
+        let tab = &mut self.tabs[index];
+        tab.last_shown = clock;
+        tab.live = true;
+        if let Some(viewport) = viewport {
+            tab.send(Command::Paint { scroll_y: tab.scroll_y, viewport });
+        }
+        self.address = AddressBar { text: self.current_address(), focused: false, selected: false };
+        self.suspend_old_tabs();
         self.redraw_later();
+    }
+
+    /// Keeps renderers only for the most recently shown tabs.
+    fn suspend_old_tabs(&mut self) {
+        let mut order: Vec<usize> = (0..self.tabs.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(self.tabs[i].last_shown));
+        for &i in order.iter().skip(LIVE_RENDERERS) {
+            let tab = &mut self.tabs[i];
+            if tab.live && !tab.loading {
+                tab.live = false;
+                tab.send(Command::Suspend);
+            }
+        }
+    }
+
+    fn close_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(index);
+        tab.send(Command::Shutdown);
+        // The thread exits on its own once its current step finishes.
+        drop(tab.thread);
+        if self.tabs.is_empty() {
+            // Closing the last tab never ends the session by accident.
+            self.open_tab(Url::parse(START_URL).expect("valid URL"), None, true);
+            return;
+        }
+        let next = if index < self.active || self.active >= self.tabs.len() {
+            self.active.saturating_sub(1)
+        } else {
+            self.active
+        };
+        self.activate(next.min(self.tabs.len() - 1));
+    }
+
+    fn navigate_tab(&mut self, index: usize, url: Url, from_history: bool, referrer: Option<Url>) {
+        let Some(tab) = self.tabs.get_mut(index) else { return };
+        tab.status = format!("Loading {url} …");
+        tab.loading = true;
+        tab.live = true;
+        tab.send(Command::Navigate { url, from_history, referrer });
+        self.redraw_later();
+    }
+
+    fn navigate(&mut self, url: Url, from_history: bool) {
+        self.navigate_tab(self.active, url, from_history, None);
     }
 
     fn submit_address(&mut self) {
@@ -180,50 +333,75 @@ impl App {
                 self.address.focused = false;
                 self.navigate(url, false);
             }
-            Err(e) => self.status = e,
+            Err(e) => {
+                if let Some(t) = self.tab_mut() {
+                    t.status = e;
+                }
+            }
         }
         self.redraw_later();
     }
 
     fn go_history(&mut self, delta: isize) {
-        let Some(pos) = self.history_pos.checked_add_signed(delta).filter(|p| *p < self.history.len()) else { return };
-        self.history_pos = pos;
-        let url = self.history[pos].clone();
+        let Some(tab) = self.tab_mut() else { return };
+        let Some(pos) = tab.history_pos.checked_add_signed(delta).filter(|p| *p < tab.history.len()) else { return };
+        tab.history_pos = pos;
+        let url = tab.history[pos].clone();
         self.navigate(url, true);
     }
 
     fn scroll_by(&mut self, dy: f32) {
-        let Some(window) = &self.window else { return };
-        let viewport = Geometry::of(window).viewport;
-        let max = (self.page_height - viewport.height).max(0.0);
-        let next = (self.scroll_y + dy).clamp(0.0, max);
-        if next != self.scroll_y {
-            self.scroll_y = next;
-            self.send(Command::Paint { scroll_y: next, viewport });
+        let Some(viewport) = self.viewport() else { return };
+        let Some(tab) = self.tab_mut() else { return };
+        let max = (tab.page_height - viewport.height).max(0.0);
+        let next = (tab.scroll_y + dy).clamp(0.0, max);
+        if next != tab.scroll_y {
+            tab.scroll_y = next;
+            tab.send(Command::Paint { scroll_y: next, viewport });
         }
     }
 
     fn repaint_page(&self) {
-        if let Some(window) = &self.window {
-            self.send(Command::Paint { scroll_y: self.scroll_y, viewport: Geometry::of(window).viewport });
+        if let (Some(viewport), Some(tab)) = (self.viewport(), self.tab()) {
+            tab.send(Command::Paint { scroll_y: tab.scroll_y, viewport });
         }
     }
 
     fn current_address(&self) -> String {
-        self.url.as_ref().map(|u| u.to_string()).unwrap_or_default()
+        self.tab().and_then(|t| t.url.as_ref()).map(|u| u.to_string()).unwrap_or_default()
+    }
+
+    fn new_tab_with_address(&mut self) {
+        self.open_tab(Url::parse(START_URL).expect("valid URL"), None, true);
+        self.address = AddressBar { text: String::new(), focused: true, selected: false };
     }
 
     fn handle_key(&mut self, event: &KeyEvent) {
         let ctrl = self.modifiers.control_key();
         let alt = self.modifiers.alt_key();
+        let shift = self.modifiers.shift_key();
         match event.logical_key.as_ref() {
             Key::Character(c) if ctrl && c.eq_ignore_ascii_case("l") => {
                 self.address = AddressBar { text: self.current_address(), focused: true, selected: true };
             }
+            Key::Character(c) if ctrl && c.eq_ignore_ascii_case("t") => self.new_tab_with_address(),
+            Key::Character(c) if ctrl && c.eq_ignore_ascii_case("w") => self.close_tab(self.active),
+            Key::Named(NamedKey::Tab) if ctrl => {
+                let n = self.tabs.len();
+                if n > 1 {
+                    self.activate(if shift { (self.active + n - 1) % n } else { (self.active + 1) % n });
+                }
+            }
+            Key::Character(c) if ctrl && c.len() == 1 && ('1'..='9').contains(&c.chars().next().unwrap_or(' ')) => {
+                let digit = c.chars().next().and_then(|d| d.to_digit(10)).unwrap_or(1) as usize;
+                // Ctrl+9 is always the last tab.
+                let index = if digit == 9 { self.tabs.len().saturating_sub(1) } else { digit - 1 };
+                self.activate(index);
+            }
             Key::Named(NamedKey::ArrowLeft) if alt => self.go_history(-1),
             Key::Named(NamedKey::ArrowRight) if alt => self.go_history(1),
             Key::Named(NamedKey::F5) => {
-                if let Some(url) = self.url.clone() {
+                if let Some(url) = self.tab().and_then(|t| t.url.clone()) {
                     self.navigate(url, true);
                 }
             }
@@ -259,30 +437,52 @@ impl App {
             Key::Named(NamedKey::PageUp) => self.scroll_by(-self.page_step()),
             Key::Named(NamedKey::ArrowDown) => self.scroll_by(LINE),
             Key::Named(NamedKey::ArrowUp) => self.scroll_by(-LINE),
-            Key::Named(NamedKey::Home) => self.scroll_by(-self.scroll_y),
-            Key::Named(NamedKey::End) => self.scroll_by(self.page_height),
+            Key::Named(NamedKey::Home) => {
+                let y = self.tab().map_or(0.0, |t| t.scroll_y);
+                self.scroll_by(-y);
+            }
+            Key::Named(NamedKey::End) => {
+                let h = self.tab().map_or(0.0, |t| t.page_height);
+                self.scroll_by(h);
+            }
             _ => {}
         }
         self.redraw_later();
     }
 
     fn page_step(&self) -> f32 {
-        self.window.as_ref().map_or(600.0, |w| Geometry::of(w).viewport.height * 0.9)
+        self.viewport().map_or(600.0, |v| v.height * 0.9)
     }
 
-    fn click(&mut self) {
+    fn click(&mut self, button: MouseButton) {
         let Some(window) = &self.window else { return };
         let g = Geometry::of(window);
         let (cx, cy) = (self.cursor.x as f32, self.cursor.y as f32);
-        if cy < g.top as f32 {
-            self.address = AddressBar { text: self.current_address(), focused: true, selected: true };
+        let middle = button == MouseButton::Middle;
+        if cy < g.strip as f32 {
+            let width_css = g.width as f32 / g.scale;
+            match chrome::strip_hit(cx / g.scale, self.tabs.len(), width_css) {
+                Some(chrome::StripHit::Tab(i)) if middle => self.close_tab(i),
+                Some(chrome::StripHit::Tab(i)) => self.activate(i),
+                Some(chrome::StripHit::Close(i)) => self.close_tab(i),
+                Some(chrome::StripHit::NewTab) => self.new_tab_with_address(),
+                None => {}
+            }
+        } else if cy < g.top as f32 {
+            if !middle {
+                self.address = AddressBar { text: self.current_address(), focused: true, selected: true };
+            }
         } else {
             self.address.focused = false;
             let page_w = g.viewport.width * g.scale;
             let page_h = g.viewport.height * g.scale;
             let (px, py) = (cx - g.page_x as f32, cy - g.page_y as f32);
-            if (0.0..page_w).contains(&px) && (0.0..page_h).contains(&py) {
-                self.send(Command::Click { x: px / g.scale, y: py / g.scale + self.scroll_y });
+            let new_tab = middle || self.modifiers.control_key();
+            if (0.0..page_w).contains(&px)
+                && (0.0..page_h).contains(&py)
+                && let Some(tab) = self.tab()
+            {
+                tab.send(Command::Click { x: px / g.scale, y: py / g.scale + tab.scroll_y, new_tab });
             }
         }
         self.redraw_later();
@@ -290,16 +490,36 @@ impl App {
 
     /// Re-renders the bars only when what they show has changed.
     fn update_bars(&mut self, g: &Geometry) {
+        let width_css = g.width as f32 / g.scale;
+        let labels: Vec<(String, bool)> = self.tabs.iter().map(|t| (t.label(), t.loading)).collect();
+        let strip_key = format!("{labels:?}|{}|{}|{}", self.active, g.width, g.scale);
         let address = self.address_text();
         let top_key = format!("{address}|{}|{}|{}|{}", self.address.focused, self.address.selected, g.width, g.scale);
-        let bottom_key = format!("{:?}|{}|{}|{}", self.title, self.status, g.width, g.scale);
-        if self.bars.as_ref().is_some_and(|(tk, _, bk, _)| *tk == top_key && *bk == bottom_key) {
-            return;
-        }
-        let width_css = g.width as f32 / g.scale;
-        let top = chrome::top_bar(&address, self.address.focused, self.address.selected, width_css, g.scale);
-        let bottom = chrome::status_bar(self.title.as_deref(), &self.status, width_css, g.scale);
-        self.bars = Some((top_key, top, bottom_key, bottom));
+        let title = self.tab().and_then(|t| t.title.clone());
+        let status = match self.tab() {
+            Some(t) if !t.status.is_empty() => t.status.clone(),
+            _ => self.net_status.clone(),
+        };
+        let bottom_key = format!("{title:?}|{status}|{}|{}", g.width, g.scale);
+        let old = self.bars.take();
+        let (strip, top, bottom) = match old {
+            Some(b) => (
+                (b.strip_key == strip_key).then_some(b.strip),
+                (b.top_key == top_key).then_some(b.top),
+                (b.bottom_key == bottom_key).then_some(b.bottom),
+            ),
+            None => (None, None, None),
+        };
+        let strip = strip.unwrap_or_else(|| {
+            let tabs: Vec<chrome::TabLabel> =
+                labels.iter().map(|(title, loading)| chrome::TabLabel { title, loading: *loading }).collect();
+            chrome::tab_strip(&tabs, self.active, width_css, g.scale)
+        });
+        let top = top.unwrap_or_else(|| {
+            chrome::top_bar(&address, self.address.focused, self.address.selected, width_css, g.scale)
+        });
+        let bottom = bottom.unwrap_or_else(|| chrome::status_bar(title.as_deref(), &status, width_css, g.scale));
+        self.bars = Some(Bars { strip_key, strip, top_key, top, bottom_key, bottom });
     }
 
     fn redraw(&mut self) {
@@ -314,12 +534,13 @@ impl App {
         let Ok(mut buf) = surface.buffer_mut() else { return };
         buf.fill(BACKGROUND);
 
-        if let Some((_, top, _, bottom)) = &self.bars {
-            blit(&mut buf, g.width, g.height, &top.rgba, top.width, top.height, 0, 0, g.top);
+        if let Some(b) = &self.bars {
+            blit(&mut buf, g.width, g.height, &b.strip.rgba, b.strip.width, b.strip.height, 0, 0, g.strip);
+            blit(&mut buf, g.width, g.height, &b.top.rgba, b.top.width, b.top.height, 0, g.strip, g.top - g.strip);
             let bottom_y = g.height.saturating_sub(g.bottom);
-            blit(&mut buf, g.width, g.height, &bottom.rgba, bottom.width, bottom.height, 0, bottom_y, g.bottom);
+            blit(&mut buf, g.width, g.height, &b.bottom.rgba, b.bottom.width, b.bottom.height, 0, bottom_y, g.bottom);
         }
-        if let Some(f) = &self.frame {
+        if let Some(f) = self.tabs.get(self.active).and_then(|t| t.frame.as_ref()) {
             let room = g.height.saturating_sub(g.bottom).saturating_sub(g.page_y);
             blit(&mut buf, g.width, g.height, &f.rgba, f.width, f.height, g.page_x, g.page_y, room);
         }
@@ -332,12 +553,64 @@ impl App {
         if self.address.focused { self.address.text.clone() } else { self.current_address() }
     }
 
-    fn shut_down(&mut self) {
-        if let Some((tx, handle)) = self.nav.take() {
-            let _ = tx.send(Command::Shutdown);
-            let _ = handle.join();
+    fn tab_event(&mut self, id: TabId, event: TabEvent) {
+        let Some(index) = self.tabs.iter().position(|t| t.id == id) else { return };
+        let active = index == self.active;
+        let tab = &mut self.tabs[index];
+        match event {
+            TabEvent::Status(s) => tab.status = s,
+            TabEvent::Finished => tab.loading = false,
+            TabEvent::Loading { url, from_history } => {
+                if !from_history {
+                    tab.history.truncate(tab.history_pos + 1);
+                    if tab.history.last() != Some(&url) {
+                        tab.history.push(url.clone());
+                    }
+                    tab.history_pos = tab.history.len() - 1;
+                }
+                tab.url = Some(url);
+                tab.title = None;
+                tab.scroll_y = 0.0;
+                if active && !self.address.focused {
+                    self.address = AddressBar { text: self.current_address(), focused: false, selected: false };
+                }
+            }
+            TabEvent::Title(t) => tab.title = t,
+            TabEvent::Frame(f) => {
+                tab.scroll_y = f.scroll_y;
+                tab.page_height = f.page_height;
+                tab.frame = Some(f);
+            }
+            TabEvent::OpenInNewTab { url, referrer } => self.open_tab(url, Some(referrer), false),
         }
     }
+
+    fn shut_down(&mut self) {
+        for tab in self.tabs.drain(..) {
+            tab.send(Command::Shutdown);
+            let _ = tab.thread.join();
+        }
+        if let Some(net) = self.net.take() {
+            net.shutdown();
+        }
+    }
+}
+
+/// Hollow's ring (UX-06) as the window icon, drawn here rather than shipped
+/// as a file.
+fn ring_icon() -> Option<Icon> {
+    const N: u32 = 32;
+    let mut rgba = Vec::with_capacity((N * N * 4) as usize);
+    for y in 0..N {
+        for x in 0..N {
+            let (dx, dy) = (x as f32 + 0.5 - 16.0, y as f32 + 0.5 - 16.0);
+            let d = (dx * dx + dy * dy).sqrt();
+            // Anti-aliased ring between radius 9 and 14.
+            let a = ((d - 8.5).clamp(0.0, 1.0) * (14.5 - d).clamp(0.0, 1.0) * 255.0) as u8;
+            rgba.extend_from_slice(&[0x8e, 0xf0, 0xb4, a]);
+        }
+    }
+    Icon::from_rgba(rgba, N, N).ok()
 }
 
 /// Development only, behind the off-by-default `dev-dump` feature: the window
@@ -346,8 +619,8 @@ impl App {
 /// Never part of a release or `cargo xtask dist` build.
 ///
 /// `$HOLLOW_DEV_SCRIPT` drives the window without touching the desktop:
-/// `wait:SECS;goto:URL;scroll:DY;click:X,Y` (X, Y in window pixels), run
-/// through the same code paths as real input.
+/// `wait:SECS;goto:URL;scroll:DY;click:X,Y;middle:X,Y;newtab;tab:N;closetab;quit`
+/// (X, Y in window pixels), run through the same code paths as real input.
 #[cfg(feature = "dev-dump")]
 mod dev_dump {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -363,12 +636,20 @@ mod dev_dump {
         Goto(String),
         Scroll(f32),
         Click(f64, f64),
+        Middle(f64, f64),
+        NewTab,
+        Tab(usize),
+        CloseTab,
         Quit,
     }
 
     pub fn start_script(proxy: EventLoopProxy<UiEvent>) {
         let Ok(script) = std::env::var("HOLLOW_DEV_SCRIPT") else { return };
         std::thread::spawn(move || {
+            let point = |arg: &str| {
+                let (x, y) = arg.split_once(',').unwrap_or(("0", "0"));
+                (x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0))
+            };
             for step in script.split(';').map(str::trim).filter(|s| !s.is_empty()) {
                 let (op, arg) = step.split_once(':').unwrap_or((step, ""));
                 let action = match op {
@@ -379,9 +660,16 @@ mod dev_dump {
                     "goto" => Step::Goto(arg.to_owned()),
                     "scroll" => Step::Scroll(arg.parse().unwrap_or(0.0)),
                     "click" => {
-                        let (x, y) = arg.split_once(',').unwrap_or(("0", "0"));
-                        Step::Click(x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0))
+                        let (x, y) = point(arg);
+                        Step::Click(x, y)
                     }
+                    "middle" => {
+                        let (x, y) = point(arg);
+                        Step::Middle(x, y)
+                    }
+                    "newtab" => Step::NewTab,
+                    "tab" => Step::Tab(arg.parse().unwrap_or(0)),
+                    "closetab" => Step::CloseTab,
                     "quit" => Step::Quit,
                     _ => continue,
                 };
@@ -429,6 +717,7 @@ impl ApplicationHandler<UiEvent> for App {
         }
         let attrs = Window::default_attributes()
             .with_title("Hollow")
+            .with_window_icon(ring_icon())
             .with_inner_size(LogicalSize::new(1240.0, 860.0))
             .with_min_inner_size(LogicalSize::new(480.0, 320.0));
         let window = match event_loop.create_window(attrs) {
@@ -452,39 +741,21 @@ impl ApplicationHandler<UiEvent> for App {
                 return;
             }
         }
-        if !capture_protected {
-            self.status = "Warning: this window could not be hidden from screen capture".into();
-        }
-        let (tx, handle) = navigator::spawn(self.proxy.clone(), Geometry::of(&window).viewport);
         self.window = Some(window);
-        self.nav = Some((tx, handle));
+        self.net = Some(NetSlot::start(self.proxy.clone()));
         let start = self.start.take().unwrap_or_else(|| Url::parse(START_URL).expect("valid URL"));
-        self.navigate(start, false);
+        self.open_tab(start, None, true);
+        if !capture_protected && let Some(t) = self.tab_mut() {
+            t.status = "Warning: this window could not be hidden from screen capture".into();
+        }
         #[cfg(feature = "dev-dump")]
         dev_dump::start_script(self.proxy.clone());
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UiEvent) {
         match event {
-            UiEvent::Status(s) => self.status = s,
-            UiEvent::Loading { url, from_history } => {
-                if !from_history {
-                    self.history.truncate(self.history_pos + 1);
-                    if self.history.last() != Some(&url) {
-                        self.history.push(url.clone());
-                    }
-                    self.history_pos = self.history.len() - 1;
-                }
-                self.url = Some(url);
-                self.title = None;
-                self.scroll_y = 0.0;
-            }
-            UiEvent::Title(t) => self.title = t,
-            UiEvent::Frame(f) => {
-                self.scroll_y = f.scroll_y;
-                self.page_height = f.page_height;
-                self.frame = Some(f);
-            }
+            UiEvent::NetStatus(s) => self.net_status = s,
+            UiEvent::Tab(id, event) => self.tab_event(id, event),
             #[cfg(feature = "dev-dump")]
             UiEvent::Dev(step) => match step {
                 dev_dump::Step::Goto(input) => {
@@ -494,8 +765,15 @@ impl ApplicationHandler<UiEvent> for App {
                 dev_dump::Step::Scroll(dy) => self.scroll_by(dy),
                 dev_dump::Step::Click(x, y) => {
                     self.cursor = PhysicalPosition::new(x, y);
-                    self.click();
+                    self.click(MouseButton::Left);
                 }
+                dev_dump::Step::Middle(x, y) => {
+                    self.cursor = PhysicalPosition::new(x, y);
+                    self.click(MouseButton::Middle);
+                }
+                dev_dump::Step::NewTab => self.new_tab_with_address(),
+                dev_dump::Step::Tab(i) => self.activate(i),
+                dev_dump::Step::CloseTab => self.close_tab(self.active),
                 dev_dump::Step::Quit => _event_loop.exit(),
             },
         }
@@ -512,7 +790,11 @@ impl ApplicationHandler<UiEvent> for App {
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::CursorMoved { position, .. } => self.cursor = position,
-            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => self.click(),
+            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. }
+                if matches!(button, MouseButton::Left | MouseButton::Middle) =>
+            {
+                self.click(button)
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 let scale = self.window.as_ref().map_or(1.0, |w| w.scale_factor() as f32);
                 let dy = match delta {
