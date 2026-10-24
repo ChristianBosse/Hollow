@@ -13,6 +13,9 @@ pub struct Page {
     viewport: Viewport,
     /// Where the last frame was painted, for repaints after a click or key.
     scroll_y: f32,
+    /// The second round of resources (images the linked stylesheets use)
+    /// has been asked for.
+    asked_css_images: bool,
 }
 
 impl Page {
@@ -21,7 +24,15 @@ impl Page {
         let html = to_html(content_type, body);
         let doc = Document::parse(&html, &url);
         let forms = doc.forms();
-        Page { doc, forms, resources: Resources::new(), layout: None, viewport: sane(viewport), scroll_y: 0.0 }
+        Page {
+            doc,
+            forms,
+            resources: Resources::new(),
+            layout: None,
+            viewport: sane(viewport),
+            scroll_y: 0.0,
+            asked_css_images: false,
+        }
     }
 
     pub fn viewport(&self) -> Viewport {
@@ -61,6 +72,18 @@ impl Page {
             }
         }
         self.layout = None;
+    }
+
+    /// Once, after the first resources: images used by the linked
+    /// stylesheets, which could only be known once those arrived. `None`
+    /// when there are none (or they were already asked for).
+    pub fn stylesheet_images(&mut self) -> Option<Vec<String>> {
+        if self.asked_css_images {
+            return None;
+        }
+        self.asked_css_images = true;
+        let urls: Vec<String> = self.doc.stylesheet_image_urls(&self.resources).into_iter().map(String::from).collect();
+        (!urls.is_empty()).then_some(urls)
     }
 
     pub fn paint(&mut self, scroll_y: f32, viewport: Viewport) -> Frame {

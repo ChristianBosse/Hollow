@@ -216,6 +216,10 @@ pub(crate) struct Style {
     pub white_space: WhiteSpace,
     pub list_style: ListStyle,
     pub visible: bool,
+    /// `opacity: 0` here (not inherited, but hides the whole subtree).
+    pub transparent: bool,
+    /// Inside an element with `opacity: 0`.
+    pub in_transparent: bool,
     pub text_transform: TextTransform,
     /// Horizontal, vertical.
     pub border_spacing: [f32; 2],
@@ -293,6 +297,8 @@ impl Style {
             white_space: WhiteSpace::Normal,
             list_style: ListStyle::Disc,
             visible: true,
+            transparent: false,
+            in_transparent: false,
             text_transform: TextTransform::None,
             border_spacing: [0.0; 2],
             border_collapse: false,
@@ -355,6 +361,7 @@ impl Style {
             white_space: parent.white_space,
             list_style: parent.list_style,
             visible: parent.visible,
+            in_transparent: parent.in_transparent || parent.transparent,
             text_transform: parent.text_transform,
             border_spacing: parent.border_spacing,
             border_collapse: parent.border_collapse,
@@ -744,6 +751,7 @@ fn cascade<'a>(
             Decl::WhiteSpace(w) => s.white_space = w,
             Decl::ListStyle(l) => s.list_style = l,
             Decl::Visible(v) => s.visible = v,
+            Decl::Transparent(t) => s.transparent = t,
             Decl::TextTransform(t) => s.text_transform = t,
             Decl::Margin(side, l) => s.margin[side & 3] = len(l),
             Decl::Padding(side, l) => s.padding[side & 3] = len(l),
@@ -799,6 +807,11 @@ fn cascade<'a>(
     }
     if s.out_of_flow() || s.float != Float::None {
         s.display = s.display.blockified();
+    }
+    // Nothing inside a fully transparent element shows, whatever its own
+    // `visibility` says.
+    if s.transparent || s.in_transparent {
+        s.visible = false;
     }
     s
 }
@@ -924,6 +937,7 @@ fn apply_wide(s: &mut Style, parent: &Style, p: Prop, w: Wide, spec: &mut Specif
         Prop::WhiteSpace => s.white_space = src.white_space,
         Prop::ListStyle => s.list_style = src.list_style,
         Prop::Visibility => s.visible = src.visible,
+        Prop::Opacity => s.transparent = src.transparent,
         Prop::TextTransform => s.text_transform = src.text_transform,
         Prop::Margin(i) => s.margin[i & 3] = src.margin[i & 3],
         Prop::Padding(i) => s.padding[i & 3] = src.padding[i & 3],

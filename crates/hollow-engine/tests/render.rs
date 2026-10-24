@@ -1122,3 +1122,14 @@ fn inline_svg_icons_use_page_symbols_and_current_color() {
     let f = layout(&html, 100.0).paint(0.0, 40.0, 1.0);
     assert_eq!(pixel(&f, 10, 10), [0, 0, 255, 255], "the symbol from the hidden sprite, in the text color");
 }
+
+#[test]
+fn opacity_zero_hides_the_whole_subtree() {
+    let html = format!(
+        "{PLAIN}<div style='opacity:0'><input type=checkbox style='display:block;width:20px;height:20px'>\
+         <p style='visibility:visible;margin:0'>still hidden</p></div><div style='opacity:0.5'>dimmed but shown</div>"
+    );
+    let f = layout(&html, 300.0).paint(0.0, 60.0, 1.0);
+    assert_eq!(ink(&f, 0, 0, 300, 38), 0, "nothing of the transparent box shows");
+    assert!(ink(&f, 0, 38, 300, 60) > 20, "partial opacity still draws");
+}

@@ -55,8 +55,14 @@ fn main() -> ExitCode {
             BrokerToRenderer::Resources { images, stylesheets } => match current.as_mut() {
                 Some(p) => {
                     p.add_resources(images, stylesheets);
-                    let viewport = p.viewport();
-                    vec![RendererToBroker::Frame(p.paint(0.0, viewport))]
+                    match p.stylesheet_images() {
+                        // A second, last round for the stylesheets' images.
+                        Some(images) => vec![RendererToBroker::NeedResources { images, stylesheets: vec![] }],
+                        None => {
+                            let viewport = p.viewport();
+                            vec![RendererToBroker::Frame(p.paint(0.0, viewport))]
+                        }
+                    }
                 }
                 None => vec![RendererToBroker::Error("no page loaded".into())],
             },

@@ -5219,7 +5219,6 @@ css/css-position/sticky/position-sticky-table-td-subpixel-zoom.html
 css/css-pseudo/first-letter-003.html
 css/css-pseudo/first-letter-background-image.html
 css/css-pseudo/first-letter-input-textarea.tentative.html
-css/css-pseudo/first-letter-opacity-001.html
 css/css-pseudo/first-letter-require-first-formatted-line.html
 css/css-pseudo/first-letter-width.html
 css/css-pseudo/first-letter-with-preceding-new-line.html
@@ -5230,7 +5229,6 @@ css/css-pseudo/first-line-font-relative-units-001.html
 css/css-pseudo/first-line-inherited.html
 css/css-pseudo/first-line-input-textarea.tentative.html
 css/css-pseudo/first-line-on-list-item-with-block-children.html
-css/css-pseudo/first-line-opacity-001.html
 css/css-pseudo/first-line-replaced-001.html
 css/css-pseudo/first-line-with-before-after.html
 css/css-pseudo/marker-content-001.html

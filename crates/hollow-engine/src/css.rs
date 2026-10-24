@@ -208,6 +208,7 @@ pub(crate) enum Prop {
     WhiteSpace,
     ListStyle,
     Visibility,
+    Opacity,
     TextTransform,
     Margin(usize),
     Padding(usize),
@@ -310,6 +311,8 @@ pub(crate) enum Decl {
     WhiteSpace(WhiteSpace),
     ListStyle(ListStyle),
     Visible(bool),
+    /// `opacity` at (or within a hair of) zero: drawn as nothing.
+    Transparent(bool),
     TextTransform(TextTransform),
     /// Side order: top, right, bottom, left.
     Margin(usize, Length),
@@ -1848,6 +1851,7 @@ fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>, base: Base<'_>) 
         "white-space" => &[Prop::WhiteSpace],
         "list-style-type" | "list-style" => &[Prop::ListStyle],
         "visibility" => &[Prop::Visibility],
+        "opacity" => &[Prop::Opacity],
         "text-transform" => &[Prop::TextTransform],
         "margin" => &[Prop::Margin(0), Prop::Margin(1), Prop::Margin(2), Prop::Margin(3)],
         "padding" => &[Prop::Padding(0), Prop::Padding(1), Prop::Padding(2), Prop::Padding(3)],
@@ -2004,6 +2008,15 @@ fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>, base: Base<'_>) 
             "hidden" | "collapse" => Some(Decl::Visible(false)),
             _ => None,
         },
+        // Partial opacity is drawn opaque; only "invisible" matters, which
+        // is how pages hide things (focus-only controls, menu toggles).
+        "opacity" => {
+            let n = match lower.strip_suffix('%') {
+                Some(p) => p.trim().parse::<f32>().ok().map(|p| p / 100.0),
+                None => lower.parse::<f32>().ok(),
+            };
+            n.filter(|n| n.is_finite()).map(|n| Decl::Transparent(n <= 0.01))
+        }
         "text-transform" => match lower.as_str() {
             "none" => Some(TextTransform::None),
             "uppercase" => Some(TextTransform::Upper),

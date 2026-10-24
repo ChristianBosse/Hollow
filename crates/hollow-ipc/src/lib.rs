@@ -240,7 +240,8 @@ pub enum BrokerToRenderer {
         body: Vec<u8>,
     },
     /// Lay out a page for display. The renderer answers `Loaded`, then
-    /// `NeedResources` (possibly empty) and waits for `Resources` before painting.
+    /// `NeedResources` (possibly empty) and waits for `Resources`. It may
+    /// ask once more, for images its stylesheets use, before painting.
     Load {
         url: String,
         content_type: Option<String>,

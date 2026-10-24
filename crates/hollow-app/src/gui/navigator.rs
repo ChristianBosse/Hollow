@@ -290,21 +290,41 @@ impl Navigator {
             RendererToBroker::Loaded { title } => self.send(TabEvent::Title(title.map(|t| sanitize(&t)))),
             other => bail!("unexpected reply from renderer: {}", short(&other)),
         }
-        let (want_images, want_sheets) = match renderer.recv::<RendererToBroker>()? {
-            RendererToBroker::NeedResources { images, stylesheets } => (images, stylesheets),
-            other => bail!("unexpected reply from renderer: {}", short(&other)),
+        // At most two rounds: what the page asks for, then the images its
+        // stylesheets use. Without `fetch`, the remembered resources are
+        // handed over again each round.
+        let (mut asked_images, mut asked_sheets, mut got_images, mut got_sheets) = (0, 0, 0, 0);
+        let mut round = 0;
+        let frame = loop {
+            let (want_images, want_sheets) = match renderer.recv::<RendererToBroker>()? {
+                RendererToBroker::NeedResources { images, stylesheets } if round < 2 => (images, stylesheets),
+                RendererToBroker::Frame(f) if round > 0 => break f,
+                RendererToBroker::Error(e) => bail!("renderer failed: {}", sanitize(&e)),
+                other => bail!("unexpected reply from renderer: {}", short(&other)),
+            };
+            round += 1;
+            if fetch {
+                let fetched = self.fetch_resources(&page.url, &want_images, &want_sheets)?;
+                (asked_images, asked_sheets) = (asked_images + want_images.len(), asked_sheets + want_sheets.len());
+                (got_images, got_sheets) = (got_images + fetched.images.len(), got_sheets + fetched.stylesheets.len());
+                page.images.extend(fetched.images);
+                page.stylesheets.extend(fetched.stylesheets);
+            }
+            renderer.send(&BrokerToRenderer::Resources {
+                images: page.images.clone(),
+                stylesheets: page.stylesheets.clone(),
+            })?;
         };
-        let mut summary = None;
-        if fetch {
-            let fetched = self.fetch_resources(&page.url, &want_images, &want_sheets)?;
-            summary = Some(fetched.summary(want_images.len(), want_sheets.len()));
-            (page.images, page.stylesheets) = (fetched.images, fetched.stylesheets);
-        }
-        renderer.send(&BrokerToRenderer::Resources {
-            images: page.images.clone(),
-            stylesheets: page.stylesheets.clone(),
-        })?;
-        let frame = expect_frame(&mut renderer)?;
+        let summary = fetch.then(|| {
+            let mut s = String::new();
+            if asked_images > 0 {
+                s += &format!(" · images {got_images}/{asked_images}");
+            }
+            if asked_sheets > 0 {
+                s += &format!(" · stylesheets {got_sheets}/{asked_sheets}");
+            }
+            s
+        });
         self.send(TabEvent::Frame(frame));
         self.renderer = Some(renderer);
         if let Some(summary) = summary.filter(|_| page.url.as_str() != START_URL) {
@@ -417,19 +437,6 @@ impl Navigator {
 struct Fetched {
     images: Vec<(String, Vec<u8>)>,
     stylesheets: Vec<(String, String)>,
-}
-
-impl Fetched {
-    fn summary(&self, images: usize, sheets: usize) -> String {
-        let mut s = String::new();
-        if images > 0 {
-            s += &format!(" · images {}/{images}", self.images.len());
-        }
-        if sheets > 0 {
-            s += &format!(" · stylesheets {}/{sheets}", self.stylesheets.len());
-        }
-        s
-    }
 }
 
 fn expect_frame(renderer: &mut Child) -> anyhow::Result<Frame> {
