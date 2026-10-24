@@ -2048,7 +2048,7 @@ name = "hollow-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "form_urlencoded",
+ "getrandom 0.4.3",
  "hollow-engine",
  "hollow-ipc",
  "hollow-sandbox",

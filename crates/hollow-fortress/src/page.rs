@@ -1,26 +1,35 @@
 //! Displaying a page: parse, ask the broker for images, lay out, paint.
 //! Everything here works on bytes the broker handed over; nothing is fetched.
 
-use hollow_engine::{Document, HitTarget, Layout, Resources};
-use hollow_ipc::{Frame, Viewport};
+use hollow_engine::{Document, FormEnctype, FormKey, FormMethod, FormState, HitTarget, Interaction, Layout, Resources};
+use hollow_ipc::{FormEncoding, FormSubmit, Frame, KeyInput, Method, Viewport};
 use url::Url;
 
 pub struct Page {
     doc: Document,
+    forms: FormState,
     resources: Resources,
     layout: Option<Layout>,
     viewport: Viewport,
+    /// Where the last frame was painted, for repaints after a click or key.
+    scroll_y: f32,
 }
 
 impl Page {
     pub fn load(url: &str, content_type: Option<&str>, body: &[u8], viewport: Viewport) -> Page {
         let url = Url::parse(url).unwrap_or_else(|_| Url::parse("about:blank").expect("valid URL"));
         let html = to_html(content_type, body);
-        Page { doc: Document::parse(&html, &url), resources: Resources::new(), layout: None, viewport: sane(viewport) }
+        let doc = Document::parse(&html, &url);
+        let forms = doc.forms();
+        Page { doc, forms, resources: Resources::new(), layout: None, viewport: sane(viewport), scroll_y: 0.0 }
     }
 
     pub fn viewport(&self) -> Viewport {
         self.viewport
+    }
+
+    pub fn scroll_y(&self) -> f32 {
+        self.scroll_y
     }
 
     pub fn title(&self) -> Option<String> {
@@ -64,18 +73,74 @@ impl Page {
         let page_height = layout.height();
         let max_scroll = (page_height - viewport.height).max(0.0);
         let scroll_y = if scroll_y.is_finite() { scroll_y.clamp(0.0, max_scroll) } else { 0.0 };
-        let f = layout.paint(scroll_y, viewport.height, viewport.scale);
+        self.scroll_y = scroll_y;
+        let f = layout.paint_forms(&self.forms, scroll_y, viewport.height, viewport.scale);
         Frame { scroll_y, page_height, width: f.width, height: f.height, rgba: f.rgba }
     }
 
-    pub fn hit_test(&mut self, x: f32, y: f32) -> Option<String> {
-        let layout = self.layout.as_ref()?;
-        match layout.hit_test(x, y)? {
-            HitTarget::Link(url) => Some(url.into()),
-            #[allow(unreachable_patterns)]
+    /// A click: a link to follow, a form to submit, or a change to the
+    /// forms that needs a repaint.
+    pub fn click(&mut self, x: f32, y: f32) -> Outcome {
+        let hit = self.layout.as_ref().and_then(|l| l.hit_test_forms(&self.forms, x, y));
+        let link = match &hit {
+            Some(HitTarget::Link(url)) => Some(String::from(url.clone())),
             _ => None,
-        }
+        };
+        let interaction = self.forms.click(&self.doc, hit.as_ref());
+        self.outcome(link, interaction)
     }
+
+    pub fn key(&mut self, key: KeyInput) -> Outcome {
+        let key = match key {
+            KeyInput::Text(t) => FormKey::Text(t),
+            KeyInput::Backspace => FormKey::Backspace,
+            KeyInput::Delete => FormKey::Delete,
+            KeyInput::Enter => FormKey::Enter,
+            KeyInput::Left => FormKey::Left,
+            KeyInput::Right => FormKey::Right,
+            KeyInput::Home => FormKey::Home,
+            KeyInput::End => FormKey::End,
+            KeyInput::Up => FormKey::Up,
+            KeyInput::Down => FormKey::Down,
+            KeyInput::Tab => FormKey::Tab,
+            KeyInput::BackTab => FormKey::BackTab,
+            KeyInput::Escape => FormKey::Escape,
+        };
+        let interaction = self.forms.key(&self.doc, &key);
+        self.outcome(None, interaction)
+    }
+
+    fn outcome(&self, link: Option<String>, interaction: Interaction) -> Outcome {
+        let (submit, repaint) = match interaction {
+            Interaction::None => (None, false),
+            Interaction::Repaint => (None, true),
+            Interaction::Submit(s) => (
+                Some(FormSubmit {
+                    action: s.action.into(),
+                    method: match s.method {
+                        FormMethod::Get => Method::Get,
+                        FormMethod::Post => Method::Post,
+                    },
+                    encoding: match s.enctype {
+                        FormEnctype::UrlEncoded => FormEncoding::UrlEncoded,
+                        FormEnctype::Multipart => FormEncoding::Multipart,
+                        FormEnctype::Plain => FormEncoding::Plain,
+                    },
+                    entries: s.entries,
+                    new_tab: s.new_tab,
+                }),
+                true,
+            ),
+        };
+        Outcome { link, submit, editing: self.forms.editing(), repaint }
+    }
+}
+
+pub struct Outcome {
+    pub link: Option<String>,
+    pub submit: Option<FormSubmit>,
+    pub editing: bool,
+    pub repaint: bool,
 }
 
 /// The broker's viewport is trusted, but a bad one must not turn into a

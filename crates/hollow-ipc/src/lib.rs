@@ -258,13 +258,54 @@ pub enum BrokerToRenderer {
         scroll_y: f32,
         viewport: Viewport,
     },
-    /// What's at this point (CSS px, page coordinates)? Answer: `Hit`.
-    HitTest {
+    /// The user clicked here (CSS px, page coordinates). Answer:
+    /// `Interacted`, then a `Frame` if it says `repaint`.
+    Click {
         x: f32,
         y: f32,
     },
+    /// A key for the focused form field. Answer as for `Click`.
+    Key(KeyInput),
     SelfTest(SelfTestPlan),
     Shutdown,
+}
+
+/// A key pressed while a page field has focus. Only the broker sees the
+/// keyboard; it forwards keys while the renderer says a field is editing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyInput {
+    Text(String),
+    Backspace,
+    Delete,
+    Enter,
+    Left,
+    Right,
+    Home,
+    End,
+    Up,
+    Down,
+    Tab,
+    BackTab,
+    Escape,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FormEncoding {
+    UrlEncoded,
+    Multipart,
+    Plain,
+}
+
+/// A form the user submitted, as the renderer built it. The broker checks
+/// the action against policy and does the encoding itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FormSubmit {
+    pub action: String,
+    pub method: Method,
+    pub encoding: FormEncoding,
+    pub entries: Vec<(String, String)>,
+    /// `target="_blank"`.
+    pub new_tab: bool,
 }
 
 /// A painted viewport: straight (non-premultiplied) RGBA8, row-major.
@@ -307,8 +348,15 @@ pub enum RendererToBroker {
         stylesheets: Vec<String>,
     },
     Frame(Frame),
-    /// Link target at the hit-tested point, unvalidated.
-    Hit(Option<String>),
+    /// What a click or key did. Links and submissions are unvalidated
+    /// suggestions; `editing` says whether keys should come here.
+    Interacted {
+        link: Option<String>,
+        submit: Option<FormSubmit>,
+        editing: bool,
+        /// A `Frame` follows.
+        repaint: bool,
+    },
     SelfTestReport(Vec<Check>),
     Error(String),
 }
@@ -318,6 +366,8 @@ pub enum RendererToBroker {
 pub const MAX_FRAME_PIXELS: u64 = 5120 * 2880;
 const MAX_IMAGE_REQUESTS: usize = 64;
 const MAX_STYLESHEET_REQUESTS: usize = 32;
+/// Entries one form submission may carry.
+pub const MAX_FORM_ENTRIES: usize = 4096;
 /// Largest stylesheet the broker hands to a renderer.
 pub const MAX_STYLESHEET_LEN: usize = 2 * 1024 * 1024;
 
@@ -347,7 +397,16 @@ impl Validate for RendererToBroker {
                 }
                 Ok(())
             }
-            RendererToBroker::Hit(link) => check_len("link", link.as_ref().map_or(0, String::len), MAX_LINK_LEN),
+            RendererToBroker::Interacted { link, submit, .. } => {
+                check_len("link", link.as_ref().map_or(0, String::len), MAX_LINK_LEN)?;
+                if let Some(f) = submit {
+                    check_len("form action", f.action.len(), MAX_LINK_LEN)?;
+                    check_len("form entries", f.entries.len(), MAX_FORM_ENTRIES)?;
+                    let bytes: usize = f.entries.iter().map(|(k, v)| k.len() + v.len()).sum();
+                    check_len("form data", bytes, MAX_REQUEST_BODY_LEN / 2)?;
+                }
+                Ok(())
+            }
             RendererToBroker::Rendered(p) => {
                 if let Some(t) = &p.title {
                     check_len("title", t.len(), MAX_TITLE_LEN)?;

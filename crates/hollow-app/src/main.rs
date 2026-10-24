@@ -6,6 +6,7 @@
 
 mod child;
 mod fetch;
+mod form;
 mod gui;
 mod net;
 mod policy;

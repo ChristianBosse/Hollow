@@ -64,9 +64,14 @@ fn main() -> ExitCode {
                 Some(p) => vec![RendererToBroker::Frame(p.paint(scroll_y, viewport))],
                 None => vec![RendererToBroker::Error("no page loaded".into())],
             },
-            BrokerToRenderer::HitTest { x, y } => {
-                vec![RendererToBroker::Hit(current.as_mut().and_then(|p| p.hit_test(x, y)))]
-            }
+            BrokerToRenderer::Click { x, y } => match current.as_mut() {
+                Some(p) => interacted(p, |p| p.click(x, y)),
+                None => vec![RendererToBroker::Error("no page loaded".into())],
+            },
+            BrokerToRenderer::Key(key) => match current.as_mut() {
+                Some(p) => interacted(p, |p| p.key(key)),
+                None => vec![RendererToBroker::Error("no page loaded".into())],
+            },
             BrokerToRenderer::SelfTest(plan) => vec![RendererToBroker::SelfTestReport(selftest::run(&plan))],
             BrokerToRenderer::Shutdown => return ExitCode::SUCCESS,
         };
@@ -77,4 +82,17 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// The answer to a click or key: what it did, then a fresh frame if
+/// anything visible changed.
+fn interacted(p: &mut page::Page, f: impl FnOnce(&mut page::Page) -> page::Outcome) -> Vec<RendererToBroker> {
+    let o = f(p);
+    let mut replies =
+        vec![RendererToBroker::Interacted { link: o.link, submit: o.submit, editing: o.editing, repaint: o.repaint }];
+    if o.repaint {
+        let viewport = p.viewport();
+        replies.push(RendererToBroker::Frame(p.paint(p.scroll_y(), viewport)));
+    }
+    replies
 }

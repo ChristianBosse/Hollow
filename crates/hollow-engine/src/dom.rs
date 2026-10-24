@@ -58,7 +58,8 @@ pub(crate) struct Node {
     pub parent: Option<NodeId>,
     pub children: Vec<NodeId>,
     pub data: NodeData,
-    /// Resolved `href` (links) or `src` (images).
+    /// Resolved `href` (links), `src` (images), `action` (forms) or
+    /// `formaction` (submit buttons).
     pub url: Option<Url>,
 }
 
@@ -291,7 +292,6 @@ pub(crate) fn parse(html: &str, base_url: &Url) -> Parsed {
                 if DROPPED.contains(&name.as_str())
                     || e.attr("hidden").is_some()
                     || (name == "dialog" && e.attr("open").is_none())
-                    || (name == "input" && e.attr("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("hidden")))
                 {
                     continue;
                 }
@@ -304,6 +304,9 @@ pub(crate) fn parse(html: &str, base_url: &Url) -> Parsed {
                         let url = match name.as_str() {
                             "a" | "area" => e.attr("href").and_then(|h| resolve(&base, h)),
                             "img" => image_source(e).and_then(|s| resolve(&base, s)),
+                            // Form targets; an empty `action` means the page itself.
+                            "form" => e.attr("action").and_then(|h| resolve(&base, h)),
+                            "button" | "input" => e.attr("formaction").and_then(|h| resolve(&base, h)),
                             _ => None,
                         };
                         if name == "img"

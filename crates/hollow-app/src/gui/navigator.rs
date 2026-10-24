@@ -14,14 +14,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use anyhow::{Context, bail};
-use hollow_ipc::{BrokerToRenderer, Frame, MAX_STYLESHEET_LEN, RendererToBroker, Viewport};
+use hollow_ipc::{BrokerToRenderer, Frame, KeyInput, MAX_STYLESHEET_LEN, RendererToBroker, Viewport};
 use url::Url;
 use winit::event_loop::EventLoopProxy;
 
 use crate::child::{Child, Kind};
 use crate::net::{self, Ledger, Navigation, Net};
-use crate::policy;
 use crate::terminal::sanitize;
+use crate::{form, policy};
 
 pub const START_URL: &str = "about:hollow";
 
@@ -44,6 +44,8 @@ pub enum Command {
         y: f32,
         new_tab: bool,
     },
+    /// A key for the page's focused field.
+    Key(KeyInput),
     /// Kill the renderer but keep the page, for tabs out of sight.
     Suspend,
     Shutdown,
@@ -69,8 +71,12 @@ pub enum TabEvent {
     },
     Title(Option<String>),
     Frame(Frame),
+    /// The page started a navigation of its own (a link or a form).
+    Started,
     /// A navigation ended, shown or failed.
     Finished,
+    /// Whether a page field has focus, so keys should go to the page.
+    Editing(bool),
     /// A link the user wants in a new tab.
     OpenInNewTab {
         url: Url,
@@ -210,7 +216,8 @@ impl Navigator {
                     self.viewport = viewport;
                     self.paint(scroll_y)
                 }
-                Command::Click { x, y, new_tab } => self.click(x, y, new_tab),
+                Command::Click { x, y, new_tab } => self.interact(BrokerToRenderer::Click { x, y }, new_tab),
+                Command::Key(key) => self.interact(BrokerToRenderer::Key(key), false),
                 Command::Suspend => {
                     self.renderer = None;
                     Ok(())
@@ -361,27 +368,48 @@ impl Navigator {
         Ok(())
     }
 
-    fn click(&mut self, x: f32, y: f32, new_tab: bool) -> anyhow::Result<()> {
+    /// Sends a click or key to the renderer and acts on what it says: show
+    /// the repainted frame, follow a link or submit a form.
+    fn interact(&mut self, msg: BrokerToRenderer, new_tab: bool) -> anyhow::Result<()> {
         let Some(renderer) = self.renderer()? else { return Ok(()) };
-        renderer.send(&BrokerToRenderer::HitTest { x, y })?;
-        let link = match renderer.recv::<RendererToBroker>()? {
-            RendererToBroker::Hit(link) => link,
+        renderer.send(&msg)?;
+        let (link, submit, editing, repaint) = match renderer.recv::<RendererToBroker>()? {
+            RendererToBroker::Interacted { link, submit, editing, repaint } => (link, submit, editing, repaint),
             other => bail!("unexpected reply from renderer: {}", short(&other)),
         };
-        let Some(link) = link else { return Ok(()) };
-        // What the renderer says is a link is just a suggestion.
-        let url = Url::parse(&link).with_context(|| format!("bad link {}", sanitize(&link)))?;
-        if let Err(e) = policy::check(&url) {
-            self.status(&format!("Blocked {}: {e}", sanitize(url.as_str())));
-            return Ok(());
+        if repaint {
+            let frame = expect_frame(renderer)?;
+            self.send(TabEvent::Frame(frame));
         }
+        self.send(TabEvent::Editing(editing));
         let Some(current) = self.page.as_ref().map(|p| p.url.clone()) else { return Ok(()) };
-        if new_tab {
-            self.send(TabEvent::OpenInNewTab { url, referrer: current });
-            Ok(())
+        let (url, post) = if let Some(submit) = submit {
+            // The renderer's submission is checked and encoded here.
+            let req = form::to_request(submit)?;
+            if req.new_tab {
+                self.send(TabEvent::OpenInNewTab { url: req.url, referrer: current });
+                return Ok(());
+            }
+            (req.url, req.post)
         } else {
-            self.navigate(Navigation { url, referrer: Some(&current), post: None }, false)
-        }
+            let Some(link) = link else { return Ok(()) };
+            // What the renderer says is a link is just a suggestion.
+            let url = Url::parse(&link).with_context(|| format!("bad link {}", sanitize(&link)))?;
+            if let Err(e) = policy::check(&url) {
+                self.status(&format!("Blocked {}: {e}", sanitize(url.as_str())));
+                return Ok(());
+            }
+            if new_tab {
+                self.send(TabEvent::OpenInNewTab { url, referrer: current });
+                return Ok(());
+            }
+            (url, None)
+        };
+        self.send(TabEvent::Editing(false));
+        self.send(TabEvent::Started);
+        let result = self.navigate(Navigation { url, referrer: Some(&current), post }, false);
+        self.send(TabEvent::Finished);
+        result
     }
 }
 
@@ -419,7 +447,7 @@ fn short(msg: &RendererToBroker) -> &'static str {
         RendererToBroker::Loaded { .. } => "Loaded",
         RendererToBroker::NeedResources { .. } => "NeedResources",
         RendererToBroker::Frame(_) => "Frame",
-        RendererToBroker::Hit(_) => "Hit",
+        RendererToBroker::Interacted { .. } => "Interacted",
         RendererToBroker::SelfTestReport(_) => "SelfTestReport",
         RendererToBroker::Error(_) => "Error",
     }

@@ -24,7 +24,7 @@ use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 
 use anyhow::Context;
-use hollow_ipc::{Frame, Viewport};
+use hollow_ipc::{Frame, KeyInput, Viewport};
 use softbuffer::Surface;
 use url::Url;
 use winit::application::ApplicationHandler;
@@ -127,6 +127,8 @@ struct Tab {
     page_height: f32,
     history: Vec<Url>,
     history_pos: usize,
+    /// A field on the page has focus: keys go to the page.
+    editing: bool,
     /// Larger is more recent; decides which renderers stay alive.
     last_shown: u64,
     live: bool,
@@ -241,6 +243,7 @@ impl App {
             page_height: 0.0,
             history: Vec::new(),
             history_pos: 0,
+            editing: false,
             last_shown: 0,
             live: true,
         };
@@ -405,6 +408,13 @@ impl App {
                     self.navigate(url, true);
                 }
             }
+            _ if !self.address.focused && self.tab().is_some_and(|t| t.editing) => {
+                if let Some(key) = page_key(event, ctrl, shift)
+                    && let Some(tab) = self.tab()
+                {
+                    tab.send(Command::Key(key));
+                }
+            }
             _ if self.address.focused => match event.logical_key.as_ref() {
                 Key::Named(NamedKey::Enter) => self.submit_address(),
                 Key::Named(NamedKey::Escape) => {
@@ -559,7 +569,9 @@ impl App {
         let tab = &mut self.tabs[index];
         match event {
             TabEvent::Status(s) => tab.status = s,
+            TabEvent::Started => tab.loading = true,
             TabEvent::Finished => tab.loading = false,
+            TabEvent::Editing(e) => tab.editing = e,
             TabEvent::Loading { url, from_history } => {
                 if !from_history {
                     tab.history.truncate(tab.history_pos + 1);
@@ -594,6 +606,33 @@ impl App {
             net.shutdown();
         }
     }
+}
+
+/// A key for a focused page field, if it is one fields use. Browser
+/// shortcuts were handled before this is asked.
+fn page_key(event: &KeyEvent, ctrl: bool, shift: bool) -> Option<KeyInput> {
+    Some(match event.logical_key.as_ref() {
+        Key::Named(NamedKey::Backspace) => KeyInput::Backspace,
+        Key::Named(NamedKey::Delete) => KeyInput::Delete,
+        Key::Named(NamedKey::Enter) => KeyInput::Enter,
+        Key::Named(NamedKey::ArrowLeft) => KeyInput::Left,
+        Key::Named(NamedKey::ArrowRight) => KeyInput::Right,
+        Key::Named(NamedKey::ArrowUp) => KeyInput::Up,
+        Key::Named(NamedKey::ArrowDown) => KeyInput::Down,
+        Key::Named(NamedKey::Home) => KeyInput::Home,
+        Key::Named(NamedKey::End) => KeyInput::End,
+        Key::Named(NamedKey::Tab) if shift => KeyInput::BackTab,
+        Key::Named(NamedKey::Tab) => KeyInput::Tab,
+        Key::Named(NamedKey::Escape) => KeyInput::Escape,
+        _ if ctrl => return None,
+        _ => {
+            let text: String = event.text.as_ref()?.chars().filter(|c| !c.is_control()).take(256).collect();
+            if text.is_empty() {
+                return None;
+            }
+            KeyInput::Text(text)
+        }
+    })
 }
 
 /// Hollow's ring (UX-06) as the window icon, drawn here rather than shipped

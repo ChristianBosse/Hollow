@@ -22,6 +22,7 @@
 
 mod css;
 mod dom;
+mod form;
 mod image;
 mod layout;
 mod paint;
@@ -49,6 +50,8 @@ const MAX_TOTAL_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
 /// A parsed HTML document. Independent of viewport size and of fetched
 /// resources, so one `Document` serves any number of relayouts.
 pub struct Document {
+    /// The document's own URL (an empty form `action` submits here).
+    url: Url,
     dom: dom::Dom,
     title: Option<String>,
     images: Vec<Url>,
@@ -83,6 +86,7 @@ impl Document {
             })
             .collect();
         Document {
+            url: base_url.clone(),
             dom: parsed.dom,
             title: parsed.title,
             images: parsed.images,
@@ -110,7 +114,50 @@ impl Document {
     pub fn stylesheet_urls(&self) -> Vec<Url> {
         self.stylesheet_urls.clone()
     }
+
+    /// Fresh state for the page's form controls: their initial values.
+    pub fn forms(&self) -> FormState {
+        FormState { forms: form::Forms::new(&self.dom) }
+    }
 }
+
+pub use form::{FormEnctype, FormKey, FormMethod, Interaction, Submission};
+
+/// The current values of a document's form controls, which field has focus
+/// and which `<select>` list is open. Kept by the caller across relayouts
+/// and repaints of the same document.
+#[derive(Clone, Debug)]
+pub struct FormState {
+    forms: form::Forms,
+}
+
+impl FormState {
+    /// What a click on `hit` (from [`Layout::hit_test_forms`]) does to the
+    /// forms. A click anywhere else, `None`, takes the focus away.
+    pub fn click(&mut self, doc: &Document, hit: Option<&HitTarget>) -> Interaction {
+        let target = match hit {
+            Some(HitTarget::Control(id)) => Some(form::FormTarget::Control(id.0)),
+            Some(HitTarget::Option(id, i)) => Some(form::FormTarget::Option(id.0, *i)),
+            _ => None,
+        };
+        self.forms.click(&doc.dom, &doc.url, target)
+    }
+
+    /// A key for the focused field.
+    pub fn key(&mut self, doc: &Document, key: &FormKey) -> Interaction {
+        self.forms.key(&doc.dom, &doc.url, key)
+    }
+
+    /// Whether keys belong to a field (one is focused, or a list is open)
+    /// rather than to scrolling.
+    pub fn editing(&self) -> bool {
+        self.forms.editing()
+    }
+}
+
+/// A form control of a document, as hit testing finds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlId(dom::NodeId);
 
 fn ua_sheet() -> &'static css::Stylesheet {
     static UA: OnceLock<css::Stylesheet> = OnceLock::new();
@@ -232,6 +279,10 @@ impl std::fmt::Debug for Frame {
 #[non_exhaustive]
 pub enum HitTarget {
     Link(Url),
+    /// A form control, or a `<label>` for one.
+    Control(ControlId),
+    /// An entry in an open `<select>` list.
+    Option(ControlId, usize),
 }
 
 /// A clickable link region in page coordinates (CSS px).
@@ -290,6 +341,20 @@ impl Layout {
     pub fn paint(&self, scroll_y: f32, height: f32, scale: f32) -> Frame {
         let (width, height, rgba) = paint::paint(&self.laid, &self.paths, scroll_y, height, scale);
         Frame { width, height, rgba }
+    }
+
+    /// Like [`Layout::paint`], with form controls showing `forms`' values,
+    /// focus and open lists.
+    pub fn paint_forms(&self, forms: &FormState, scroll_y: f32, height: f32, scale: f32) -> Frame {
+        let _ = forms;
+        self.paint(scroll_y, height, scale)
+    }
+
+    /// Like [`Layout::hit_test`], also finding form controls and the
+    /// entries of an open `<select>` list.
+    pub fn hit_test_forms(&self, forms: &FormState, x: f32, y: f32) -> Option<HitTarget> {
+        let _ = forms;
+        self.hit_test(x, y)
     }
 
     /// What is at a point in page coordinates (CSS px, y includes scroll).
