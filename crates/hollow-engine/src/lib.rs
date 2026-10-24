@@ -164,6 +164,19 @@ fn ua_sheet() -> &'static css::Stylesheet {
     UA.get_or_init(style::ua_sheet)
 }
 
+/// Test suites only (feature `test-fonts`, never enabled in Hollow builds):
+/// makes `font-family: <name>` use the given font data, e.g. WPT's Ahem.
+/// Names match case-insensitively and win over the bundled families. Each
+/// font has a single face (bold and italic use it unchanged).
+///
+/// Must be called once, before the first layout of the process; returns
+/// false (and registers nothing) if it is too late, called twice, or a font
+/// does not parse.
+#[cfg(feature = "test-fonts")]
+pub fn register_test_fonts(fonts: Vec<(String, Vec<u8>)>) -> bool {
+    text::register_test_fonts(fonts)
+}
+
 /// Subresources the broker fetched for a document, keyed by the absolute
 /// URLs from [`Document::image_urls`] and [`Document::stylesheet_urls`].
 #[derive(Default)]

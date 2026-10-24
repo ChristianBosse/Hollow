@@ -2603,6 +2603,10 @@ fn parse_line_height(v: &str) -> Option<LineHeightValue> {
 pub(crate) fn parse_family(v: &str) -> Family {
     for name in v.split(',') {
         let name = name.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+        #[cfg(feature = "test-fonts")]
+        if let Some(f) = crate::text::test_family(name) {
+            return f;
+        }
         let family = match name {
             "monospace" | "ui-monospace" | "courier" | "courier new" | "consolas" | "menlo" | "monaco"
             | "lucida console" | "andale mono" | "sfmono-regular" | "fira code" | "fira mono" | "source code pro"

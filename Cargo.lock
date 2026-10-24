@@ -7355,10 +7355,14 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hollow-engine",
  "netstat2",
+ "png",
+ "scraper",
  "serde_json",
  "sha2",
  "sysinfo",
+ "url",
 ]
 
 [[package]]

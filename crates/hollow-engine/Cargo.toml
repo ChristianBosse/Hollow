@@ -23,3 +23,8 @@ tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "
 url = "2.5.8"
 zune-core = "0.5.3"
 zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }
+
+[features]
+# Test suites only (cargo xtask wpt): lets the caller register extra fonts such as
+# WPT's Ahem. Never enabled in Hollow builds, which use the bundled fonts alone.
+test-fonts = []
