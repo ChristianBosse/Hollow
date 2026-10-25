@@ -1358,3 +1358,9 @@ fn justify_indent_and_rtl_boxes() {
     assert_eq!(pixel(&f, 375, 5), RED);
     assert_eq!(pixel(&f, 325, 5), BLUE);
 }
+
+#[test]
+fn hidden_inputs_take_no_room_and_draw_nothing() {
+    let f = layout(&format!("{PLAIN}<form><input type=hidden name=t value=x></form>"), 200.0).paint(0.0, 40.0, 1.0);
+    assert_eq!(ink(&f, 0, 0, 200, 40), 0);
+}

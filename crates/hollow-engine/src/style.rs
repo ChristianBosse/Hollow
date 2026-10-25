@@ -500,6 +500,7 @@ fieldset { margin: 0 2px; padding: 0.35em 0.75em 0.625em }
 legend { padding: 0 2px }
 input, textarea, select, button { font-family: sans-serif; font-size: 13.333px }
 button { display: inline-block; text-align: center }
+input[type=hidden i] { display: none }
 input, textarea { border: 1px solid #767676; background-color: white; padding: 1px 2px; color: black }
 input[type=checkbox], input[type=radio] { border: 0; padding: 0; background-color: transparent; margin: 3px 3px 3px 4px }
 input[type=range], input[type=color], input[type=file], input[type=image] { border: 0; padding: 0; background-color: transparent }
