@@ -14,7 +14,7 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::dom::{Dom, Element, NodeData, NodeId};
-use crate::style::{Display, ListStyle, TextAlign, TextTransform, VAlign, WhiteSpace};
+use crate::style::{Display, ListStyle, TextAlign, TextTransform, UnicodeBidi, VAlign, WhiteSpace};
 use crate::text::Family;
 use crate::vars;
 
@@ -203,7 +203,13 @@ pub(crate) enum Prop {
     FontStyle,
     FontFamily,
     TextAlign,
+    TextAlignLast,
+    TextJustify,
+    TextIndent,
+    WordSpacing,
     TextDecoration,
+    Direction,
+    UnicodeBidi,
     LineHeight,
     WhiteSpace,
     ListStyle,
@@ -212,6 +218,9 @@ pub(crate) enum Prop {
     TextTransform,
     Margin(usize),
     Padding(usize),
+    /// `margin-inline-start` (false) and `-end` (true).
+    MarginInline(bool),
+    PaddingInline(bool),
     Width,
     MaxWidth,
     VerticalAlign,
@@ -268,6 +277,11 @@ impl Prop {
                 | Prop::FontStyle
                 | Prop::FontFamily
                 | Prop::TextAlign
+                | Prop::TextAlignLast
+                | Prop::TextJustify
+                | Prop::TextIndent
+                | Prop::WordSpacing
+                | Prop::Direction
                 | Prop::LineHeight
                 | Prop::WhiteSpace
                 | Prop::ListStyle
@@ -303,6 +317,16 @@ pub(crate) enum Decl {
     Italic(bool),
     FontFamily(Family),
     TextAlign(TextAlign),
+    /// `None` is `auto`.
+    TextAlignLast(Option<TextAlign>),
+    /// `text-justify: none`.
+    JustifyNone(bool),
+    TextIndent(Length),
+    /// In px; `normal` is 0.
+    WordSpacing(Length),
+    /// `direction: rtl`.
+    Rtl(bool),
+    UnicodeBidi(UnicodeBidi),
     Decoration {
         underline: bool,
         line_through: bool,
@@ -317,6 +341,10 @@ pub(crate) enum Decl {
     /// Side order: top, right, bottom, left.
     Margin(usize, Length),
     Padding(usize, Length),
+    /// `margin-inline-start` (false) or `-end` (true): a side that depends
+    /// on `direction`.
+    MarginInline(bool, Length),
+    PaddingInline(bool, Length),
     /// `Length::Auto` means `auto`.
     Width(Length),
     /// `None` means `none`.
@@ -1820,6 +1848,16 @@ const BACKGROUND_ALL: [Prop; 8] = [
 ];
 
 fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>, base: Base<'_>) {
+    // Logical sizes, for the horizontal writing mode (the only one).
+    let name = match name {
+        "inline-size" => "width",
+        "block-size" => "height",
+        "min-inline-size" => "min-width",
+        "min-block-size" => "min-height",
+        "max-inline-size" => "max-width",
+        "max-block-size" => "max-height",
+        _ => name,
+    };
     let props: &[Prop] = match name {
         "display" => &[Prop::Display],
         "color" => &[Prop::Color],
@@ -1845,7 +1883,13 @@ fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>, base: Base<'_>) 
         "font-style" => &[Prop::FontStyle],
         "font-family" => &[Prop::FontFamily],
         "font" => &[Prop::FontStyle, Prop::FontWeight, Prop::FontSize, Prop::LineHeight, Prop::FontFamily],
-        "text-align" => &[Prop::TextAlign],
+        "text-align" => &[Prop::TextAlign, Prop::TextAlignLast],
+        "text-align-last" => &[Prop::TextAlignLast],
+        "text-justify" => &[Prop::TextJustify],
+        "text-indent" => &[Prop::TextIndent],
+        "word-spacing" => &[Prop::WordSpacing],
+        "direction" => &[Prop::Direction],
+        "unicode-bidi" => &[Prop::UnicodeBidi],
         "text-decoration" | "text-decoration-line" => &[Prop::TextDecoration],
         "line-height" => &[Prop::LineHeight],
         "white-space" => &[Prop::WhiteSpace],
@@ -1855,9 +1899,19 @@ fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>, base: Base<'_>) 
         "text-transform" => &[Prop::TextTransform],
         "margin" => &[Prop::Margin(0), Prop::Margin(1), Prop::Margin(2), Prop::Margin(3)],
         "padding" => &[Prop::Padding(0), Prop::Padding(1), Prop::Padding(2), Prop::Padding(3)],
-        "margin-top" => &[Prop::Margin(0)],
+        "margin-top" | "margin-block-start" => &[Prop::Margin(0)],
+        "margin-block" => &[Prop::Margin(0), Prop::Margin(2)],
+        "margin-inline-start" => &[Prop::MarginInline(false)],
+        "margin-inline-end" => &[Prop::MarginInline(true)],
+        "margin-inline" => &[Prop::MarginInline(false), Prop::MarginInline(true)],
+        "padding-block-start" => &[Prop::Padding(0)],
+        "padding-block-end" => &[Prop::Padding(2)],
+        "padding-block" => &[Prop::Padding(0), Prop::Padding(2)],
+        "padding-inline-start" => &[Prop::PaddingInline(false)],
+        "padding-inline-end" => &[Prop::PaddingInline(true)],
+        "padding-inline" => &[Prop::PaddingInline(false), Prop::PaddingInline(true)],
         "margin-right" => &[Prop::Margin(1)],
-        "margin-bottom" => &[Prop::Margin(2)],
+        "margin-bottom" | "margin-block-end" => &[Prop::Margin(2)],
         "margin-left" => &[Prop::Margin(3)],
         "padding-top" => &[Prop::Padding(0)],
         "padding-right" => &[Prop::Padding(1)],
@@ -1974,12 +2028,21 @@ fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>, base: Base<'_>) 
         },
         "font-family" => Some(Decl::FontFamily(parse_family(&lower))),
         "font" => return parse_font_shorthand(&lower, out),
-        "text-align" => match lower.as_str() {
-            "left" | "start" | "justify" | "-moz-left" | "-webkit-left" => Some(Decl::TextAlign(TextAlign::Left)),
-            "right" | "end" | "-moz-right" | "-webkit-right" => Some(Decl::TextAlign(TextAlign::Right)),
-            "center" | "-moz-center" | "-webkit-center" => Some(Decl::TextAlign(TextAlign::Center)),
+        // A shorthand for `text-align-all` and `text-align-last`.
+        "text-align" => {
+            if let Some(a) = parse_text_align(&lower) {
+                out.push(Decl::TextAlign(a));
+                out.push(Decl::TextAlignLast((lower == "justify-all").then_some(TextAlign::Justify)));
+            }
+            return;
+        }
+        "text-align-last" if lower == "auto" => Some(Decl::TextAlignLast(None)),
+        "text-justify" => match lower.as_str() {
+            "none" => Some(Decl::JustifyNone(true)),
+            "auto" | "inter-word" | "inter-character" | "distribute" => Some(Decl::JustifyNone(false)),
             _ => None,
         },
+        "text-align-last" => parse_text_align(&lower).map(|a| Decl::TextAlignLast(Some(a))),
         "text-decoration" | "text-decoration-line" => {
             let mut underline = false;
             let mut line_through = false;
@@ -1997,7 +2060,8 @@ fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>, base: Base<'_>) 
             "normal" => Some(WhiteSpace::Normal),
             "nowrap" => Some(WhiteSpace::NoWrap),
             "pre" => Some(WhiteSpace::Pre),
-            "pre-wrap" | "break-spaces" => Some(WhiteSpace::PreWrap),
+            "pre-wrap" => Some(WhiteSpace::PreWrap),
+            "break-spaces" => Some(WhiteSpace::BreakSpaces),
             "pre-line" => Some(WhiteSpace::PreLine),
             _ => None,
         }
@@ -2022,6 +2086,7 @@ fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>, base: Base<'_>) 
             "uppercase" => Some(TextTransform::Upper),
             "lowercase" => Some(TextTransform::Lower),
             "capitalize" => Some(TextTransform::Capitalize),
+            "full-size-kana" => Some(TextTransform::FullSizeKana),
             _ => None,
         }
         .map(Decl::TextTransform),
@@ -2044,6 +2109,63 @@ fn parse_property(name: &str, value: &str, out: &mut Vec<Decl>, base: Base<'_>) 
             }
             return;
         }
+        // `hanging` and `each-line` are not supported; the length still is.
+        "text-indent" => {
+            { words(&lower).into_iter().filter(|w| !matches!(*w, "hanging" | "each-line")).find_map(parse_length) }
+                .filter(|l| *l != Length::Auto)
+                .map(Decl::TextIndent)
+        }
+        // Percentages (of the space's own width) are not supported.
+        "word-spacing" if lower == "normal" => Some(Decl::WordSpacing(Length::Px(0.0))),
+        "word-spacing" => {
+            parse_length(&lower).filter(|l| !matches!(l, Length::Pct(_) | Length::Auto)).map(Decl::WordSpacing)
+        }
+        "direction" => match lower.as_str() {
+            "ltr" => Some(Decl::Rtl(false)),
+            "rtl" => Some(Decl::Rtl(true)),
+            _ => None,
+        },
+        "unicode-bidi" => match lower.trim_start_matches("-webkit-").trim_start_matches("-moz-") {
+            "normal" => Some(UnicodeBidi::Normal),
+            "embed" => Some(UnicodeBidi::Embed),
+            "isolate" => Some(UnicodeBidi::Isolate),
+            "bidi-override" => Some(UnicodeBidi::Override),
+            "isolate-override" => Some(UnicodeBidi::IsolateOverride),
+            "plaintext" => Some(UnicodeBidi::Plaintext),
+            _ => None,
+        }
+        .map(Decl::UnicodeBidi),
+        "margin-block" | "padding-block" | "margin-inline" | "padding-inline" => {
+            let vals: Option<Vec<Length>> = words(&lower).into_iter().map(parse_length).collect();
+            let (a, b) = match vals.as_deref() {
+                Some(&[a]) => (a, a),
+                Some(&[a, b]) => (a, b),
+                _ => return,
+            };
+            let padding = name.starts_with("padding");
+            if padding && !(is_valid_padding(a) && is_valid_padding(b)) {
+                return;
+            }
+            out.extend(match (name.ends_with("inline"), padding) {
+                (false, false) => [Decl::Margin(0, a), Decl::Margin(2, b)],
+                (false, true) => [Decl::Padding(0, a), Decl::Padding(2, b)],
+                (true, false) => [Decl::MarginInline(false, a), Decl::MarginInline(true, b)],
+                (true, true) => [Decl::PaddingInline(false, a), Decl::PaddingInline(true, b)],
+            });
+            return;
+        }
+        "margin-inline-start" | "margin-inline-end" => {
+            parse_length(&lower).map(|l| Decl::MarginInline(name.ends_with("end"), l))
+        }
+        "padding-inline-start" | "padding-inline-end" => {
+            parse_length(&lower).filter(|l| is_valid_padding(*l)).map(|l| Decl::PaddingInline(name.ends_with("end"), l))
+        }
+        "margin-block-start" | "margin-block-end" => {
+            parse_length(&lower).map(|l| Decl::Margin(if name.ends_with("end") { 2 } else { 0 }, l))
+        }
+        "padding-block-start" | "padding-block-end" => parse_length(&lower)
+            .filter(|l| is_valid_padding(*l))
+            .map(|l| Decl::Padding(if name.ends_with("end") { 2 } else { 0 }, l)),
         "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
             let side = match name {
                 "margin-top" => 0,
@@ -2277,6 +2399,18 @@ const BORDER_ALL: [Prop; 12] = [
     Prop::BorderColor(2),
     Prop::BorderColor(3),
 ];
+
+fn parse_text_align(v: &str) -> Option<TextAlign> {
+    Some(match v {
+        "left" | "-moz-left" | "-webkit-left" => TextAlign::Left,
+        "right" | "-moz-right" | "-webkit-right" => TextAlign::Right,
+        "start" => TextAlign::Start,
+        "justify" | "justify-all" => TextAlign::Justify,
+        "end" => TextAlign::End,
+        "center" | "-moz-center" | "-webkit-center" => TextAlign::Center,
+        _ => return None,
+    })
+}
 
 /// `border-top-width` -> 0, ..., `border-left-color` -> 3.
 fn side_of(name: &str) -> Option<usize> {

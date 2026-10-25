@@ -3,8 +3,9 @@
 //! references: an SVG can only use what is inside it (or, for inline SVG,
 //! symbols and gradients defined elsewhere in the same page).
 //!
-//! Text in SVG uses only the bundled DejaVu fonts, never the system's, so it
-//! renders the same everywhere and can't probe installed fonts.
+//! Text in SVG uses only the bundled fonts (DejaVu and the fallback fonts),
+//! never the system's, so it renders the same everywhere and can't probe
+//! installed fonts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
@@ -49,6 +50,10 @@ fn fonts() -> Arc<resvg::usvg::fontdb::Database> {
             dejavu::sans_mono::bold(),
         ] {
             db.load_font_data(data.to_vec());
+        }
+        // The same fallback fonts as HTML text, for scripts DejaVu lacks.
+        for &data in crate::text::fallback_font_data() {
+            db.load_font_source(resvg::usvg::fontdb::Source::Binary(Arc::new(data)));
         }
         db.set_sans_serif_family("DejaVu Sans");
         db.set_serif_family("DejaVu Serif");

@@ -2131,6 +2131,7 @@ dependencies = [
  "scraper",
  "skrifa 0.49.0",
  "tiny-skia 0.12.0",
+ "unicode-bidi",
  "url",
  "zune-core",
  "zune-jpeg",

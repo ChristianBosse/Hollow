@@ -5,3 +5,5 @@ crates/hollow-net/testdata/** -text
 fuzz/seeds/** -text
 fuzz/regressions/** -text
 crates/hollow-fuzz-targets/data/** -text
+# Bundled fonts.
+crates/hollow-engine/fonts/*.ttf binary

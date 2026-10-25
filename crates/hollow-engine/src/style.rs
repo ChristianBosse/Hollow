@@ -95,9 +95,26 @@ pub(crate) struct BgLayer {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TextAlign {
+    /// Left in left-to-right text, right in right-to-left.
+    Start,
+    End,
+    /// Lines that wrap fill the line; the last line is start-aligned.
+    Justify,
     Left,
     Right,
     Center,
+}
+
+/// `unicode-bidi`: how an element takes part in the bidi algorithm.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum UnicodeBidi {
+    Normal,
+    Embed,
+    Isolate,
+    /// `bidi-override`.
+    Override,
+    IsolateOverride,
+    Plaintext,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -106,6 +123,9 @@ pub(crate) enum WhiteSpace {
     NoWrap,
     Pre,
     PreWrap,
+    /// As `pre-wrap` (spaces wrapping like other characters is not
+    /// supported), except that ideographic spaces don't hang.
+    BreakSpaces,
     PreLine,
 }
 
@@ -114,10 +134,10 @@ impl WhiteSpace {
         matches!(self, WhiteSpace::Normal | WhiteSpace::NoWrap | WhiteSpace::PreLine)
     }
     pub fn keeps_newlines(self) -> bool {
-        matches!(self, WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::PreLine)
+        matches!(self, WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::BreakSpaces | WhiteSpace::PreLine)
     }
     pub fn wraps(self) -> bool {
-        matches!(self, WhiteSpace::Normal | WhiteSpace::PreWrap | WhiteSpace::PreLine)
+        matches!(self, WhiteSpace::Normal | WhiteSpace::PreWrap | WhiteSpace::BreakSpaces | WhiteSpace::PreLine)
     }
 }
 
@@ -140,6 +160,7 @@ pub(crate) enum TextTransform {
     Upper,
     Lower,
     Capitalize,
+    FullSizeKana,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -212,6 +233,14 @@ pub(crate) struct Style {
     pub italic: bool,
     pub family: Family,
     pub text_align: TextAlign,
+    /// `None` is `auto`.
+    pub text_align_last: Option<TextAlign>,
+    /// `text-justify: none`: justified lines are start-aligned instead.
+    pub justify_none: bool,
+    pub text_indent: Len,
+    pub word_spacing: f32,
+    /// `direction: rtl`.
+    pub rtl: bool,
     pub line_height: LineHeight,
     pub white_space: WhiteSpace,
     pub list_style: ListStyle,
@@ -229,6 +258,7 @@ pub(crate) struct Style {
     pub quotes: Option<QuoteList>,
     // Not inherited.
     pub display: Display,
+    pub unicode_bidi: UnicodeBidi,
     pub background: Option<Color>,
     /// Image layers, top first; `None` when there are none.
     pub bg_layers: Option<Arc<[BgLayer]>>,
@@ -292,7 +322,12 @@ impl Style {
             weight: 400,
             italic: false,
             family: DEFAULT_FAMILY,
-            text_align: TextAlign::Left,
+            text_align: TextAlign::Start,
+            text_align_last: None,
+            justify_none: false,
+            text_indent: Len::Px(0.0),
+            word_spacing: 0.0,
+            rtl: false,
             line_height: LineHeight::Normal,
             white_space: WhiteSpace::Normal,
             list_style: ListStyle::Disc,
@@ -305,6 +340,7 @@ impl Style {
             caption_bottom: false,
             quotes: None,
             display: Display::Inline,
+            unicode_bidi: UnicodeBidi::Normal,
             background: None,
             bg_layers: None,
             bg_color_clip: BoxArea::Border,
@@ -357,6 +393,11 @@ impl Style {
             italic: parent.italic,
             family: parent.family,
             text_align: parent.text_align,
+            text_align_last: parent.text_align_last,
+            justify_none: parent.justify_none,
+            text_indent: parent.text_indent,
+            word_spacing: parent.word_spacing,
+            rtl: parent.rtl,
             line_height: parent.line_height,
             white_space: parent.white_space,
             list_style: parent.list_style,
@@ -427,8 +468,8 @@ q::after { content: close-quote }
 body { margin: 8px }
 p, dl, multicol { margin: 1em 0 }
 blockquote, figure { margin: 1em 40px }
-dd { margin-left: 40px }
-ul, ol, menu, dir { margin: 1em 0; padding-left: 40px }
+dd { margin-inline-start: 40px }
+ul, ol, menu, dir { margin: 1em 0; padding-inline-start: 40px }
 ul { list-style-type: disc }
 ol { list-style-type: decimal }
 ul ul, ol ul, menu ul, ul menu { list-style-type: circle }
@@ -465,6 +506,9 @@ input[type=range], input[type=color], input[type=file], input[type=image] { bord
 select { border: 1px solid #767676; background-color: #e9e9ed; padding: 1px 2px; color: black; box-sizing: border-box }
 button, input[type=submit], input[type=button], input[type=reset] { border: 1px solid #8f8f9d; border-radius: 4px; padding: 1px 6px; background-color: #e9e9ed; color: black; box-sizing: border-box }
 summary { font-weight: bold }
+bdi, output, [dir] { unicode-bidi: isolate }
+bdo, bdo[dir] { unicode-bidi: isolate-override }
+textarea[dir=auto i], pre[dir=auto i] { unicode-bidi: plaintext }
 "#;
 
 /// Extra rules for quirks-mode documents (HTML Standard, rendering section):
@@ -501,6 +545,8 @@ pub(crate) struct AuthorSheet<'a> {
 
 /// Pseudo-elements one document may generate; later ones are dropped.
 const MAX_PSEUDO_ELEMENTS: usize = 50_000;
+/// Characters one document may scan to resolve `dir=auto`, in total.
+const MAX_AUTO_DIR_SCAN: usize = 1 << 20;
 
 /// Computed styles of one document at one viewport width.
 pub(crate) struct Styles {
@@ -527,6 +573,7 @@ pub(crate) fn compute(dom: &Dom, ua: &Stylesheet, author: &[AuthorSheet<'_>], wi
     let tree = css::Tree::new(dom);
     let mut custom = vars::Custom::new(dom.nodes.len());
     let base = Some(&dom.base);
+    let mut auto_dir_budget = MAX_AUTO_DIR_SCAN;
     // The arena is in document order, so a parent is always computed before
     // its children and ancestors can be gathered by walking parent links.
     for (id, node) in dom.nodes.iter().enumerate() {
@@ -553,7 +600,12 @@ pub(crate) fn compute(dom: &Dom, ua: &Stylesheet, author: &[AuthorSheet<'_>], wi
                     for_pseudo.extend(matched.iter().filter(|m| m.pseudo.is_some()).copied());
                     matched.retain(|m| m.pseudo.is_none());
                 }
-                let hints = presentational_hints(el, &chain, base);
+                let mut hints = presentational_hints(el, &chain, base);
+                match dir_attr(el) {
+                    Some(Some(rtl)) => hints.push(Decl::Rtl(rtl)),
+                    Some(None) => hints.extend(auto_direction(dom, id, &mut auto_dir_budget).map(Decl::Rtl)),
+                    None => {}
+                }
                 let inline = el.attr("style").map(|s| css::parse_declarations(s, base)).unwrap_or_default();
                 let s = cascade(&parent, &matched, own_ua, &hints, &inline, root_font_size, width, |decls| {
                     custom.apply(id, node.parent, decls)
@@ -652,6 +704,16 @@ fn cascade<'a>(
             _ => {}
         }
     }
+    // And `direction`, which says which physical side the logical margins
+    // and paddings are.
+    for d in decls.iter().map(|d| &**d) {
+        match d {
+            Decl::Rtl(rtl) => s.rtl = *rtl,
+            Decl::Wide(Prop::Direction, w) => s.rtl = *w != Wide::Initial && parent.rtl,
+            _ => {}
+        }
+    }
+    let inline_side = |end: bool, rtl: bool| if end != rtl { 1 } else { 3 };
     let em = s.font_size;
     let len = |l: Length| -> Len {
         let clamp = |v: f32| if v.is_nan() { 0.0 } else { v.clamp(-MAX_EXTENT, MAX_EXTENT) };
@@ -736,6 +798,12 @@ fn cascade<'a>(
             Decl::Italic(v) => s.italic = v,
             Decl::FontFamily(f) => s.family = f,
             Decl::TextAlign(a) => s.text_align = a,
+            Decl::TextAlignLast(a) => s.text_align_last = a,
+            Decl::JustifyNone(v) => s.justify_none = v,
+            Decl::TextIndent(l) => s.text_indent = len(l),
+            Decl::WordSpacing(l) => s.word_spacing = len(l).resolve(0.0).clamp(-1000.0, 1000.0),
+            Decl::Rtl(_) => {}
+            Decl::UnicodeBidi(u) => s.unicode_bidi = u,
             Decl::Decoration { underline: u, line_through: l } => {
                 spec.underline = u;
                 spec.line_through = l;
@@ -755,6 +823,8 @@ fn cascade<'a>(
             Decl::TextTransform(t) => s.text_transform = t,
             Decl::Margin(side, l) => s.margin[side & 3] = len(l),
             Decl::Padding(side, l) => s.padding[side & 3] = len(l),
+            Decl::MarginInline(end, l) => s.margin[inline_side(end, s.rtl)] = len(l),
+            Decl::PaddingInline(end, l) => s.padding[inline_side(end, s.rtl)] = len(l),
             Decl::Width(l) => s.width = len(l),
             Decl::MaxWidth(l) => s.max_width = l.map(len),
             Decl::VerticalAlign(v) => s.vertical_align = v,
@@ -929,6 +999,12 @@ fn apply_wide(s: &mut Style, parent: &Style, p: Prop, w: Wide, spec: &mut Specif
         Prop::FontStyle => s.italic = src.italic,
         Prop::FontFamily => s.family = src.family,
         Prop::TextAlign => s.text_align = src.text_align,
+        Prop::TextAlignLast => s.text_align_last = src.text_align_last,
+        Prop::TextJustify => s.justify_none = src.justify_none,
+        Prop::TextIndent => s.text_indent = src.text_indent,
+        Prop::WordSpacing => s.word_spacing = src.word_spacing,
+        Prop::Direction => {}
+        Prop::UnicodeBidi => s.unicode_bidi = src.unicode_bidi,
         Prop::TextDecoration => {
             spec.underline = false;
             spec.line_through = false;
@@ -941,6 +1017,14 @@ fn apply_wide(s: &mut Style, parent: &Style, p: Prop, w: Wide, spec: &mut Specif
         Prop::TextTransform => s.text_transform = src.text_transform,
         Prop::Margin(i) => s.margin[i & 3] = src.margin[i & 3],
         Prop::Padding(i) => s.padding[i & 3] = src.padding[i & 3],
+        Prop::MarginInline(end) => {
+            let i = if end != s.rtl { 1 } else { 3 };
+            s.margin[i] = src.margin[i];
+        }
+        Prop::PaddingInline(end) => {
+            let i = if end != s.rtl { 1 } else { 3 };
+            s.padding[i] = src.padding[i];
+        }
         Prop::Width => s.width = src.width,
         Prop::MaxWidth => s.max_width = src.max_width,
         Prop::VerticalAlign => s.vertical_align = src.vertical_align,
@@ -1047,7 +1131,8 @@ fn presentational_hints(el: &Element, chain: &[&Element], base: Base<'_>) -> Vec
             ("img" | "table" | "iframe" | "object" | "embed", _) => {}
             (_, "center" | "middle") => out.push(Decl::TextAlign(TextAlign::Center)),
             (_, "right") => out.push(Decl::TextAlign(TextAlign::Right)),
-            (_, "left" | "justify") => out.push(Decl::TextAlign(TextAlign::Left)),
+            (_, "left") => out.push(Decl::TextAlign(TextAlign::Left)),
+            (_, "justify") => out.push(Decl::TextAlign(TextAlign::Justify)),
             _ => {}
         }
     }
@@ -1098,6 +1183,53 @@ fn presentational_hints(el: &Element, chain: &[&Element], base: Base<'_>) -> Vec
         out.extend(ls.map(Decl::ListStyle));
     }
     out
+}
+
+/// The `dir` attribute: `Some(Some(rtl))` for `ltr`/`rtl`, `Some(None)` for
+/// `auto` (and `<bdi>` without a valid one), `None` otherwise.
+fn dir_attr(el: &Element) -> Option<Option<bool>> {
+    match el.attr("dir").map(|d| d.trim().to_ascii_lowercase()).as_deref() {
+        Some("ltr") => Some(Some(false)),
+        Some("rtl") => Some(Some(true)),
+        Some("auto") => Some(None),
+        _ if el.name == "bdi" => Some(None),
+        _ => None,
+    }
+}
+
+/// The direction of a `dir=auto` element (HTML's auto directionality): that
+/// of the first strong character in its text, skipping elements with their
+/// own direction and text that is never shown. `None` when there is none
+/// (the element then keeps its parent's), or the scan budget ran out.
+fn auto_direction(dom: &Dom, id: NodeId, budget: &mut usize) -> Option<bool> {
+    use unicode_bidi::BidiClass;
+    let mut stack: Vec<NodeId> = dom.nodes[id].children.iter().rev().copied().collect();
+    while let Some(n) = stack.pop() {
+        match &dom.nodes[n].data {
+            NodeData::Text(t) => {
+                for c in t.chars() {
+                    if *budget == 0 {
+                        return None;
+                    }
+                    *budget -= 1;
+                    match unicode_bidi::bidi_class(c) {
+                        BidiClass::L => return Some(false),
+                        BidiClass::R | BidiClass::AL => return Some(true),
+                        _ => {}
+                    }
+                }
+            }
+            NodeData::Element(el) => {
+                if matches!(el.name.as_str(), "bdi" | "script" | "style" | "textarea") || dir_attr(el).is_some() {
+                    continue;
+                }
+                *budget = budget.saturating_sub(1);
+                stack.extend(dom.nodes[n].children.iter().rev().copied());
+            }
+            NodeData::Root => {}
+        }
+    }
+    None
 }
 
 /// HTML dimension attribute: `100`, `100px` or `50%`.

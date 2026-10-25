@@ -40,7 +40,7 @@ use crate::content::{GenItem, Generated};
 use crate::css::Color;
 use crate::dom::{Dom, Element, NodeData, NodeId};
 use crate::style::{
-    Clear, Display, Float, Len, ListStyle, Style, Styles, TextAlign, TextTransform, VAlign, WhiteSpace,
+    Clear, Display, Float, Len, ListStyle, Style, Styles, TextAlign, TextTransform, UnicodeBidi, VAlign, WhiteSpace,
 };
 use crate::text::{self, FaceId, Shaper};
 
@@ -139,6 +139,13 @@ enum Item {
         boxid: BoxId,
         style: NodeId,
     },
+    /// A bidi control character where an inline element with `direction`
+    /// or `unicode-bidi` starts or ends (CSS Writing Modes 3 §2.4.2). Takes
+    /// part in the bidi algorithm only.
+    Bidi {
+        ch: char,
+        style: NodeId,
+    },
 }
 
 impl Item {
@@ -149,7 +156,8 @@ impl Item {
             | Item::Field { style, .. }
             | Item::Break { style }
             | Item::Atomic { style, .. }
-            | Item::Abs { style, .. } => *style,
+            | Item::Abs { style, .. }
+            | Item::Bidi { style, .. } => *style,
         }
     }
     fn link(&self) -> Option<u32> {
@@ -502,7 +510,7 @@ impl<'a> Builder<'a> {
             Item::Text { text, style, .. } => {
                 !self.styles[*style].white_space.collapses_spaces() || text.chars().any(|c| !c.is_ascii_whitespace())
             }
-            Item::Abs { .. } => false,
+            Item::Abs { .. } | Item::Bidi { .. } => false,
             _ => true,
         });
         if meaningful && !self.full() {
@@ -739,7 +747,10 @@ impl<'a> Builder<'a> {
             }
             _ => {
                 let bg = st.background.or(ctx.bg);
+                let (open, close) = bidi_controls(st);
+                items.extend(open.iter().map(|&ch| Item::Bidi { ch, style: node }));
                 self.collect(container, node, blocks, items, InlineCtx { bg, ..ctx }, depth + 1);
+                items.extend(close.iter().map(|&ch| Item::Bidi { ch, style: node }));
             }
         }
     }
@@ -954,7 +965,7 @@ impl<'a> Builder<'a> {
 pub(crate) fn collapse(text: &str, ws: WhiteSpace, last_space: &mut bool) -> String {
     let mut out = String::with_capacity(text.len());
     match ws {
-        WhiteSpace::Pre | WhiteSpace::PreWrap => {
+        WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::BreakSpaces => {
             out.push_str(text);
             if !text.is_empty() {
                 *last_space = false;
@@ -987,16 +998,34 @@ pub(crate) fn collapse(text: &str, ws: WhiteSpace, last_space: &mut bool) -> Str
     out
 }
 
+/// The bidi control characters an inline element's `unicode-bidi` and
+/// `direction` stand for, at its start and its end.
+fn bidi_controls(st: &Style) -> (&'static [char], &'static [char]) {
+    let rtl = st.rtl;
+    match st.unicode_bidi {
+        UnicodeBidi::Normal => (&[], &[]),
+        UnicodeBidi::Embed => (if rtl { &['\u{202B}'] } else { &['\u{202A}'] }, &['\u{202C}']),
+        UnicodeBidi::Isolate => (if rtl { &['\u{2067}'] } else { &['\u{2066}'] }, &['\u{2069}']),
+        UnicodeBidi::Override => (if rtl { &['\u{202E}'] } else { &['\u{202D}'] }, &['\u{202C}']),
+        UnicodeBidi::IsolateOverride => {
+            (if rtl { &['\u{2067}', '\u{202E}'] } else { &['\u{2066}', '\u{202D}'] }, &['\u{202C}', '\u{2069}'])
+        }
+        UnicodeBidi::Plaintext => (&['\u{2068}'], &['\u{2069}']),
+    }
+}
+
 fn transform(text: &str, t: TextTransform) -> String {
     match t {
         TextTransform::None => text.to_owned(),
         TextTransform::Upper => text.to_uppercase(),
         TextTransform::Lower => text.to_lowercase(),
+        TextTransform::FullSizeKana => text.chars().map(full_size_kana).collect(),
         TextTransform::Capitalize => {
             let mut out = String::with_capacity(text.len());
             let mut start = true;
             for c in text.chars() {
-                if start && c.is_alphabetic() {
+                // Circled letters are symbols, not letters, despite their case.
+                if start && c.is_alphabetic() && !('\u{24B6}'..='\u{24E9}').contains(&c) {
                     out.extend(c.to_uppercase());
                 } else {
                     out.push(c);
@@ -1006,6 +1035,15 @@ fn transform(text: &str, t: TextTransform) -> String {
             out
         }
     }
+}
+
+/// `text-transform: full-size-kana` (CSS Text 3, Appendix G).
+fn full_size_kana(c: char) -> char {
+    const SMALL: &str =
+        "ぁぃぅぇぉゕゖっゃゅょゎァィゥェォヵㇰヶㇱㇲッㇳㇴㇵㇶㇷㇸㇹㇺャュョㇻㇼㇽㇾㇿヮｧｨｩｪｫｯｬｭｮ𛄲𛅐𛅑𛅒𛅕𛅤𛅥𛅦𛅧";
+    const FULL: &str =
+        "あいうえおかけつやゆよわアイウエオカクケシスツトヌハヒフヘホムヤユヨラリルレロワｱｲｳｴｵﾂﾔﾕﾖこゐゑをコヰヱヲン";
+    SMALL.chars().position(|s| s == c).and_then(|i| FULL.chars().nth(i)).unwrap_or(c)
 }
 
 fn marker_text(style: ListStyle, n: i64) -> Option<String> {
@@ -1251,31 +1289,88 @@ impl Flow {
     }
 }
 
-enum Atom {
-    Word(Vec<Seg>),
-    Space { item: u32, w: f32, can_break: bool, collapsible: bool },
-    Break,
-    Object { item: u32 },
-    Abs { item: u32 },
+/// The inline content of a block container, ready for line breaking.
+struct Inline {
+    atoms: Vec<Atom>,
+    /// Where each bidi paragraph starts (an atom index; the first is 0) and
+    /// whether it runs right to left. Forced line breaks separate them.
+    paras: Vec<(u32, bool)>,
 }
 
+impl Inline {
+    /// Whether the paragraph holding atom `ai` runs right to left.
+    fn rtl_at(&self, ai: usize) -> bool {
+        let i = self.paras.partition_point(|&(start, _)| start as usize <= ai);
+        i > 0 && self.paras[i - 1].1
+    }
+}
+
+/// Atoms hold their bidi embedding level (even is left to right).
+enum Atom {
+    Word(Vec<Seg>),
+    /// `hang`: an ideographic space, which stays at the end of a line but
+    /// hangs past it rather than wrapping.
+    Space {
+        item: u32,
+        w: f32,
+        can_break: bool,
+        collapsible: bool,
+        hang: bool,
+        level: u8,
+    },
+    Break,
+    Object {
+        item: u32,
+        level: u8,
+    },
+    Abs {
+        item: u32,
+        level: u8,
+    },
+}
+
+/// A run of one word in one face, font size and bidi level, shaped as a
+/// unit.
 struct Seg {
     item: u32,
     face: FaceId,
     size: f32,
+    level: u8,
+    /// In logical order (see [`text::Shaped`]).
     glyphs: Vec<Glyph>,
     w: f32,
+}
+
+impl Seg {
+    fn rtl(&self) -> bool {
+        self.level & 1 == 1
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Glyph {
     id: u32,
-    /// Pen position before this glyph, px from the segment start.
+    /// Advance of the glyphs before this one in logical order, px from the
+    /// segment's start (its right edge when right to left).
     pen: f32,
+    adv: f32,
     dx: f32,
     dy: f32,
     cluster: u32,
 }
+
+/// The text being built into a [`Seg`].
+struct Run {
+    text: String,
+    face: FaceId,
+    level: u8,
+}
+
+/// Paragraph text past this many bytes gets [`approximate_levels`] instead
+/// of the full bidi algorithm.
+const MAX_BIDI_BYTES: usize = 64 * 1024;
+/// Segments one word may have before [`cap_word`] ends it.
+const MAX_WORD_SEGS: usize = 64;
 
 /// A slice of one segment of a word, as placed on a line.
 #[derive(Clone, Copy)]
@@ -1290,7 +1385,9 @@ struct Piece {
 
 enum FragKind {
     Text(Piece),
-    Space,
+    Space {
+        hang: bool,
+    },
     /// An image, form control or inline-block: `base` is its baseline,
     /// measured from its top.
     Object {
@@ -1302,9 +1399,12 @@ enum FragKind {
 
 struct Frag {
     item: u32,
+    /// Logical position on the line, until [`visual_order`] says where it
+    /// goes.
     x: f32,
     w: f32,
     kind: FragKind,
+    level: u8,
 }
 
 #[derive(Default)]
@@ -1313,14 +1413,17 @@ struct Line {
     w: f32,
     /// Whether anything but out-of-flow markers is on the line.
     content: bool,
+    /// Ended by wrapping, not by a forced break or the end of the text.
+    wrapped: bool,
 }
 
 impl Line {
     fn trim(&mut self) {
-        while matches!(self.frags.last(), Some(Frag { kind: FragKind::Space, .. })) {
+        while matches!(self.frags.last(), Some(Frag { kind: FragKind::Space { hang: false }, .. })) {
             self.frags.pop();
         }
-        self.w = self.frags.iter().rev().find(|f| !matches!(f.kind, FragKind::Abs)).map_or(0.0, |f| f.x + f.w);
+        let end = self.frags.iter().rev().find(|f| !matches!(f.kind, FragKind::Abs | FragKind::Space { hang: true }));
+        self.w = end.map_or(0.0, |f| f.x + f.w);
     }
 }
 
@@ -1394,9 +1497,11 @@ fn face_of(st: &Style) -> FaceId {
 
 struct Ctx<'a> {
     boxes: &'a [LBox],
+    /// Per box: its first line gets `text-indent`.
+    first_line: Vec<bool>,
     styles: &'a [Style],
     shaper: Shaper,
-    atoms: Vec<Option<Rc<Vec<Atom>>>>,
+    atoms: Vec<Option<Rc<Inline>>>,
     intrinsic: Vec<Option<(f32, f32)>>,
     deco: Vec<Option<Deco>>,
     glyph_budget: usize,
@@ -1427,6 +1532,8 @@ struct Ctx<'a> {
     pending_seq: usize,
     /// Definite height of the containing block, for percentage heights.
     cb_h: Option<f32>,
+    /// The containing block is right to left.
+    cb_rtl: bool,
     /// A size the next laid-out box must take, set by whoever placed it
     /// (flex items, floats, inline-blocks, absolutely positioned boxes).
     force_w: Option<f32>,
@@ -1490,7 +1597,24 @@ pub(crate) fn layout(dom: &Dom, styles: &Styles, generated: &Generated, resource
 
     let (canvas, canvas_node) = canvas_color(dom, styles);
     let Builder { boxes, links: link_targets, images, image_ids, .. } = b;
+    // Boxes whose first line is their block container's first line: real
+    // ones, and anonymous ones that come first in their parent.
+    let mut first_line = vec![false; boxes.len()];
+    for (i, b) in boxes.iter().enumerate() {
+        first_line[i] |= !b.anon;
+        match &b.kind {
+            Kind::Block(children) => {
+                if let Some(&c) = children.first() {
+                    first_line[c] = true;
+                }
+            }
+            // Anonymous flex items are block containers of their own.
+            Kind::Flex(children) => children.iter().for_each(|&c| first_line[c] = true),
+            _ => {}
+        }
+    }
     let mut ctx = Ctx {
+        first_line,
         boxes: &boxes,
         styles,
         shaper: Shaper::new(),
@@ -1513,6 +1637,7 @@ pub(crate) fn layout(dom: &Dom, styles: &Styles, generated: &Generated, resource
         abs: vec![Vec::new()],
         pending_seq: 0,
         cb_h: None,
+        cb_rtl: false,
         force_w: None,
         force_h: None,
         canvas_node,
@@ -1746,6 +1871,9 @@ impl Ctx<'_> {
             for p in frame.iter_mut().filter(|p| s.pending.contains(&p.seq)) {
                 p.x += dx;
                 p.y += dy;
+                if let Some(r) = &mut p.right {
+                    *r += dx;
+                }
             }
         }
     }
@@ -1882,7 +2010,8 @@ impl Ctx<'_> {
         let st = &self.styles[b.style];
         if !b.anon {
             if st.out_of_flow() {
-                self.add_pending(id, x, flow.next());
+                let right = self.cb_rtl.then_some(x + cb_w);
+                self.add_pending_rtl(id, x, flow.next(), right);
                 return None;
             }
             if st.float != Float::None {
@@ -2032,6 +2161,9 @@ impl Ctx<'_> {
             match (g.auto[3], g.auto[1]) {
                 (true, true) => ml += (free / 2.0).max(0.0),
                 (true, false) => ml += free.max(0.0),
+                // Over-constrained: in a right-to-left containing block the
+                // left margin gives (CSS 2.1 §10.3.3).
+                (false, false) if self.cb_rtl && !b.anon => ml += free,
                 _ => {}
             }
         }
@@ -2054,6 +2186,7 @@ impl Ctx<'_> {
 
         // Paint layer and clip for this box and its descendants.
         let saved = (self.cb_h, self.z, self.clip, self.paint_path, self.paint_depth);
+        let saved_rtl = std::mem::replace(&mut self.cb_rtl, st.rtl);
         let positioned = !b.anon && st.positioned();
         if positioned {
             if let Some(z) = st.z_index {
@@ -2172,6 +2305,7 @@ impl Ctx<'_> {
             self.finish_frame(pad);
         }
         (self.cb_h, self.z, self.clip, self.paint_path, self.paint_depth) = saved;
+        self.cb_rtl = saved_rtl;
         let first_baseline = match first_baseline {
             None if b.marker.is_some() && st.visible => {
                 let (a, d, lh) = text_metrics(st);
@@ -2179,7 +2313,7 @@ impl Ctx<'_> {
             }
             fb => fb,
         };
-        self.marker(b, st, content_x, border_top + bt + pt, first_baseline);
+        self.marker(b, st, content_x, content_x + w, border_top + bt + pt, first_baseline);
         if !b.anon && st.position == crate::style::Position::Relative {
             let (dx, dy) = self.relative_offset(st, cb_w);
             let span = self.span_since(start);
@@ -2303,8 +2437,8 @@ impl Ctx<'_> {
         }
     }
 
-    /// List marker, hanging to the left of the content box.
-    fn marker(&mut self, b: &LBox, st: &Style, content_x: f32, top: f32, baseline: Option<f32>) {
+    /// List marker, hanging outside the content box at its start side.
+    fn marker(&mut self, b: &LBox, st: &Style, left: f32, right: f32, top: f32, baseline: Option<f32>) {
         let Some(text) = &b.marker else { return };
         if !st.visible {
             return;
@@ -2313,19 +2447,21 @@ impl Ctx<'_> {
         let baseline = baseline.unwrap_or(top + ascent);
         let face = face_of(st);
         let Some(f) = text::face(face) else { return };
-        let shaped = self.shaper.shape(face, text);
+        // The gap that separates the marker from the text goes on its inner side.
+        let text = if st.rtl { format!(" {}", text.trim_end()) } else { text.clone() };
+        let shaped = self.shaper.shape(face, &text, false);
         let k = f.scale(st.font_size);
         let w = shaped.advance as f32 * k;
         let start = self.glyphs.len() as u32;
         for g in &shaped.glyphs {
-            self.glyphs.push(PlacedGlyph { id: g.id, x: (g.pen + g.dx) as f32 * k, y: -(g.dy as f32) * k });
+            self.glyphs.push(PlacedGlyph { id: g.id, x: shaped.x(g) as f32 * k, y: -(g.dy as f32) * k });
         }
         let end = self.glyphs.len() as u32;
         self.push(DisplayItem::Text {
             face,
             size: st.font_size,
             color: st.color,
-            x: content_x - w,
+            x: if st.rtl { right } else { left - w },
             y: baseline,
             glyphs: start..end,
         });
@@ -2333,116 +2469,212 @@ impl Ctx<'_> {
 
     // -- Inline formatting ---------------------------------------------------
 
-    fn atoms(&mut self, id: BoxId) -> Rc<Vec<Atom>> {
+    fn atoms(&mut self, id: BoxId) -> Rc<Inline> {
         if let Some(a) = &self.atoms[id] {
             return a.clone();
         }
-        let boxes = self.boxes;
-        let atoms = match &boxes[id].kind {
-            Kind::Inline(items) => Rc::new(self.tokenize(items)),
-            _ => Rc::new(Vec::new()),
+        let (boxes, styles) = (self.boxes, self.styles);
+        let inline = match &boxes[id].kind {
+            Kind::Inline(items) => Rc::new(self.tokenize(items, &styles[boxes[id].style])),
+            _ => Rc::new(Inline { atoms: Vec::new(), paras: vec![(0, false)] }),
         };
-        self.atoms[id] = Some(atoms.clone());
-        atoms
+        self.atoms[id] = Some(inline.clone());
+        inline
     }
 
-    fn tokenize(&mut self, items: &[Item]) -> Vec<Atom> {
+    fn tokenize(&mut self, items: &[Item], block: &Style) -> Inline {
         let styles = self.styles;
+        let bidi = Bidi::new(items, block);
         let mut atoms = Vec::new();
+        let mut paras = vec![(0, bidi.rtl_at(0))];
         let mut word: Vec<Seg> = Vec::new();
         let mut col = 0usize;
+        // The previous character of the current word and its face, for
+        // fallback and for line breaks between ideographs.
+        let mut prev: Option<(char, FaceId)> = None;
         for (i, item) in items.iter().enumerate() {
+            let start = bidi.starts[i];
             let i = i as u32;
             match item {
                 Item::Text { text, style, .. } => {
                     let st = &styles[*style];
                     let ws = st.white_space;
-                    let face = face_of(st);
-                    let space_w = self.space_width(face, st.font_size);
-                    let mut run = String::new();
-                    for c in text.chars() {
+                    let primary = face_of(st);
+                    let space_w = self.space_width(primary, st.font_size) + st.word_spacing;
+                    let mut run = Run { text: String::new(), face: primary, level: bidi.level(start) };
+                    let mut chars = text.char_indices().peekable();
+                    while let Some((at, c)) = chars.next() {
+                        let level = bidi.level(start + at);
                         match c {
                             '\n' if ws.keeps_newlines() => {
-                                self.push_run(&mut word, &mut run, i, face, st.font_size);
+                                self.push_run(&mut word, &mut run, i, st.font_size);
                                 flush_word(&mut atoms, &mut word);
                                 atoms.push(Atom::Break);
+                                paras.push((atoms.len() as u32, bidi.rtl_at(start + at + 1)));
                                 col = 0;
+                                prev = None;
                             }
                             '\r' if ws.keeps_newlines() => {}
                             ' ' | '\t' | '\n' | '\r' | '\x0C' if ws.collapses_spaces() => {
-                                self.push_run(&mut word, &mut run, i, face, st.font_size);
+                                self.push_run(&mut word, &mut run, i, st.font_size);
                                 flush_word(&mut atoms, &mut word);
                                 atoms.push(Atom::Space {
                                     item: i,
                                     w: space_w,
                                     can_break: ws.wraps(),
                                     collapsible: true,
+                                    hang: false,
+                                    level,
                                 });
+                                prev = None;
                             }
-                            ' ' | '\t' if ws == WhiteSpace::PreWrap => {
+                            ' ' | '\t' if matches!(ws, WhiteSpace::PreWrap | WhiteSpace::BreakSpaces) => {
                                 let n = if c == '\t' { 8 - col % 8 } else { 1 };
+                                let level = if c == '\t' { bidi.para_level(start + at) } else { level };
                                 col += n;
-                                self.push_run(&mut word, &mut run, i, face, st.font_size);
+                                self.push_run(&mut word, &mut run, i, st.font_size);
                                 flush_word(&mut atoms, &mut word);
                                 atoms.push(Atom::Space {
                                     item: i,
                                     w: space_w * n as f32,
                                     can_break: true,
                                     collapsible: false,
+                                    hang: false,
+                                    level,
                                 });
+                                prev = None;
                             }
                             '\t' => {
                                 let n = 8 - col % 8;
                                 col += n;
-                                run.extend(std::iter::repeat_n(' ', n));
+                                let level = bidi.para_level(start + at);
+                                if !run.text.is_empty() && run.level != level {
+                                    self.push_run(&mut word, &mut run, i, st.font_size);
+                                }
+                                if run.text.is_empty() {
+                                    (run.face, run.level) = (primary, level);
+                                }
+                                run.text.extend(std::iter::repeat_n(' ', n));
+                                prev = None;
+                            }
+                            // Ideographic spaces end a line by hanging past it.
+                            '\u{3000}' if ws.wraps() && ws != WhiteSpace::BreakSpaces => {
+                                self.push_run(&mut word, &mut run, i, st.font_size);
+                                flush_word(&mut atoms, &mut word);
+                                let face = text::pick_face(primary, c, None, None);
+                                let w = text::face(face).map_or(st.font_size, |f| {
+                                    self.shaper.shape(face, "\u{3000}", false).advance as f32 * f.scale(st.font_size)
+                                });
+                                atoms.push(Atom::Space {
+                                    item: i,
+                                    w,
+                                    can_break: true,
+                                    collapsible: false,
+                                    hang: true,
+                                    level,
+                                });
+                                prev = None;
                             }
                             '\u{200B}' => {
-                                self.push_run(&mut word, &mut run, i, face, st.font_size);
+                                self.push_run(&mut word, &mut run, i, st.font_size);
                                 flush_word(&mut atoms, &mut word);
-                                atoms.push(Atom::Space { item: i, w: 0.0, can_break: ws.wraps(), collapsible: false });
+                                atoms.push(Atom::Space {
+                                    item: i,
+                                    w: 0.0,
+                                    can_break: ws.wraps(),
+                                    collapsible: false,
+                                    hang: false,
+                                    level,
+                                });
+                                prev = None;
                             }
+                            // Isolates keep their place (and level) on the line,
+                            // which reordering needs; the other bidi formatting
+                            // characters have done their work.
+                            '\u{2066}'..='\u{2069}' => {
+                                self.push_run(&mut word, &mut run, i, st.font_size);
+                                flush_word(&mut atoms, &mut word);
+                                atoms.push(Atom::Abs { item: i, level });
+                            }
+                            c if is_bidi_control(c) => {}
                             c => {
-                                run.push(c);
+                                let face = text::pick_face(primary, c, prev, chars.peek().map(|&(_, n)| n));
+                                // Marks and joiners keep their base's level, so a
+                                // word never splits inside a cluster.
+                                let level = if prev.is_some() && joins_cluster(c) { run.level } else { level };
+                                if let Some((p, _)) = prev
+                                    && ws.wraps()
+                                    && cjk_break(p, c)
+                                {
+                                    self.push_run(&mut word, &mut run, i, st.font_size);
+                                    flush_word(&mut atoms, &mut word);
+                                    atoms.push(Atom::Space {
+                                        item: i,
+                                        w: 0.0,
+                                        can_break: true,
+                                        collapsible: false,
+                                        hang: false,
+                                        level,
+                                    });
+                                } else if !run.text.is_empty() && (face != run.face || level != run.level) {
+                                    self.push_run(&mut word, &mut run, i, st.font_size);
+                                    cap_word(&mut atoms, &mut word, i, level, ws.wraps());
+                                }
+                                if run.text.is_empty() {
+                                    (run.face, run.level) = (face, level);
+                                }
+                                run.text.push(c);
                                 col += 1;
+                                prev = Some((c, face));
                             }
                         }
                     }
-                    self.push_run(&mut word, &mut run, i, face, st.font_size);
+                    self.push_run(&mut word, &mut run, i, st.font_size);
+                    cap_word(&mut atoms, &mut word, i, run.level, ws.wraps());
                 }
                 Item::Break { .. } => {
                     flush_word(&mut atoms, &mut word);
                     atoms.push(Atom::Break);
+                    paras.push((atoms.len() as u32, bidi.rtl_at(start + '\u{2029}'.len_utf8())));
                     col = 0;
+                    prev = None;
                 }
                 Item::Image { .. } | Item::Field { .. } | Item::Atomic { .. } => {
                     flush_word(&mut atoms, &mut word);
-                    atoms.push(Atom::Object { item: i });
+                    atoms.push(Atom::Object { item: i, level: bidi.level(start) });
+                    prev = None;
                 }
                 Item::Abs { .. } => {
                     flush_word(&mut atoms, &mut word);
-                    atoms.push(Atom::Abs { item: i });
+                    atoms.push(Atom::Abs { item: i, level: bidi.level(start) });
                 }
+                Item::Bidi { ch: '\u{2066}'..='\u{2069}', .. } => {
+                    flush_word(&mut atoms, &mut word);
+                    atoms.push(Atom::Abs { item: i, level: bidi.level(start) });
+                }
+                Item::Bidi { .. } => {}
             }
         }
         flush_word(&mut atoms, &mut word);
-        atoms
+        Inline { atoms, paras }
     }
 
     fn space_width(&mut self, face: FaceId, size: f32) -> f32 {
         let Some(f) = text::face(face) else { return size * 0.3 };
-        self.shaper.shape(face, " ").advance as f32 * f.scale(size)
+        self.shaper.shape(face, " ", false).advance as f32 * f.scale(size)
     }
 
-    fn push_run(&mut self, word: &mut Vec<Seg>, run: &mut String, item: u32, face: FaceId, size: f32) {
-        if run.is_empty() {
+    fn push_run(&mut self, word: &mut Vec<Seg>, run: &mut Run, item: u32, size: f32) {
+        if run.text.is_empty() {
             return;
         }
-        let text = std::mem::take(run);
+        let text = std::mem::take(&mut run.text);
         if self.glyph_budget == 0 {
             return;
         }
-        let Some(f) = text::face(face) else { return };
-        let shaped = self.shaper.shape(face, &text);
+        let Some(f) = text::face(run.face) else { return };
+        let rtl = run.level & 1 == 1;
+        let shaped = self.shaper.shape(run.face, &text, rtl);
         let n = shaped.glyphs.len().min(self.glyph_budget);
         self.glyph_budget -= n;
         let k = f.scale(size);
@@ -2453,13 +2685,14 @@ impl Ctx<'_> {
             .map(|g| Glyph {
                 id: g.id,
                 pen: g.pen as f32 * k,
+                adv: g.adv as f32 * k,
                 dx: g.dx as f32 * k,
                 dy: g.dy as f32 * k,
                 cluster: g.cluster,
             })
             .collect();
         let w = if n == shaped.glyphs.len() { shaped.advance as f32 * k } else { glyphs.last().map_or(0.0, |g| g.pen) };
-        word.push(Seg { item, face, size, glyphs, w: clamp_extent(w) });
+        word.push(Seg { item, face: run.face, size, level: run.level, glyphs, w: clamp_extent(w) });
     }
 
     /// Size and baseline (from the top) of an object on a line `avail` wide.
@@ -2487,7 +2720,8 @@ impl Ctx<'_> {
         let styles = self.styles;
         let b = &boxes[id];
         let Kind::Inline(items) = &b.kind else { return None };
-        let atoms = self.atoms(id);
+        let inline = self.atoms(id);
+        let atoms = &inline.atoms[..];
         if atoms.is_empty() {
             return None;
         }
@@ -2507,11 +2741,19 @@ impl Ctx<'_> {
         let mut first = None;
         let mut breaker = Breaker::new();
         let mut skips = 0;
+        // `text-indent` moves the block's first line in from its start side.
+        let mut indent = if self.first_line[id] { block_style.text_indent.resolve(w) } else { 0.0 };
         loop {
-            let (l, r) = self.band(y, strut, x, x + w);
+            let (mut l, mut r) = self.band(y, strut, x, x + w);
+            let rtl = inline.rtl_at(breaker.rest.first().map_or(breaker.ai, |p| p.atom as usize));
+            if rtl {
+                r -= indent;
+            } else {
+                l += indent;
+            }
             let avail = r - l;
             let saved = breaker.clone();
-            let Some(line) = breaker.next(self, &atoms, items, &measured, avail) else { break };
+            let Some(line) = breaker.next(self, atoms, items, &measured, avail) else { break };
             // Narrowed by floats and still too wide: try below the next one.
             if line.w > avail + 0.01
                 && (l > x || r < x + w)
@@ -2529,7 +2771,8 @@ impl Ctx<'_> {
                 y = y.max(top);
                 placed = true;
             }
-            let (h, baseline) = self.emit_line(&line, &atoms, items, &measured, block_style, l, y, avail);
+            let (h, baseline) = self.emit_line(&line, atoms, items, &measured, block_style, rtl, l, y, avail);
+            indent = 0.0;
             if line.content {
                 first.get_or_insert(baseline);
             }
@@ -2561,6 +2804,7 @@ impl Ctx<'_> {
         items: &[Item],
         measured: &[Option<Measured>],
         block: &Style,
+        rtl: bool,
         x: f32,
         top: f32,
         avail: f32,
@@ -2580,7 +2824,7 @@ impl Ctx<'_> {
             let st = &styles[items[f.item as usize].style()];
             let shift = baseline_shift(st);
             match f.kind {
-                FragKind::Text(_) | FragKind::Space => {
+                FragKind::Text(_) | FragKind::Space { .. } => {
                     let (a, d) = half_leading(st);
                     above = above.max(a - shift);
                     below = below.max(d + shift);
@@ -2601,19 +2845,38 @@ impl Ctx<'_> {
             _ => by - base,
         };
         let baseline = top + above;
-        let offset = match block.text_align {
-            TextAlign::Left => 0.0,
-            TextAlign::Center => ((avail - line.w) / 2.0).max(0.0),
-            TextAlign::Right => (avail - line.w).max(0.0),
+        let mut free = avail - line.w;
+        let mut widths: Vec<f32> = line.frags.iter().map(|f| f.w).collect();
+        // The last line, and one before a forced break, follow `text-align-last`.
+        let align = match block.text_align_last {
+            Some(last) if !line.wrapped => last,
+            None if !line.wrapped && block.text_align == TextAlign::Justify => TextAlign::Start,
+            _ => block.text_align,
         };
-        for f in &line.frags {
+        if align == TextAlign::Justify && !block.justify_none && free > 0.0 {
+            free -= justify(&line.frags, &mut widths, free);
+        }
+        // A line too long for its box overflows at the end side.
+        let offset = if free < 0.0 {
+            if rtl { free } else { 0.0 }
+        } else {
+            match (align, rtl) {
+                (TextAlign::Left, _) | (TextAlign::Start | TextAlign::Justify, false) | (TextAlign::End, true) => 0.0,
+                (TextAlign::Center, _) => free / 2.0,
+                (TextAlign::Right, _) | (TextAlign::Start | TextAlign::Justify, true) | (TextAlign::End, false) => free,
+            }
+        };
+        // Right-to-left runs are reordered for display once the line is known.
+        let xs = visual_order(&line.frags, &widths);
+        for (fi, f) in line.frags.iter().enumerate() {
             let item = &items[f.item as usize];
             let st = &styles[item.style()];
-            let fx = x + offset + f.x;
+            let fx = x + offset + xs[fi];
+            let fw = widths[fi];
             let by = baseline + baseline_shift(st);
             if let FragKind::Abs = f.kind {
                 if let Item::Abs { boxid, .. } = item {
-                    self.add_pending(*boxid, fx, top);
+                    self.add_pending_rtl(*boxid, fx, top, rtl.then_some(fx));
                 }
                 continue;
             }
@@ -2633,18 +2896,19 @@ impl Ctx<'_> {
             }
             if let Some(link) = item.link()
                 && st.visible
+                && fw > 0.0
             {
-                self.links.push((Rect { x: fx, y: top, w: f.w, h: height }, link));
+                self.links.push((Rect { x: fx, y: top, w: fw, h: height }, link));
             }
             if !st.visible {
                 continue;
             }
             match &f.kind {
-                FragKind::Text(_) | FragKind::Space => {
+                FragKind::Text(_) | FragKind::Space { .. } => {
                     let face = face_of(st);
                     let (a, d, _) = text_metrics(st);
                     if let Item::Text { bg: Some(bg), .. } = item {
-                        self.push(DisplayItem::Rect { rect: Rect { x: fx, y: by - a, w: f.w, h: a + d }, color: *bg });
+                        self.push(DisplayItem::Rect { rect: Rect { x: fx, y: by - a, w: fw, h: a + d }, color: *bg });
                     }
                     if let FragKind::Text(p) = &f.kind
                         && let Atom::Word(segs) = &atoms[p.atom as usize]
@@ -2652,7 +2916,10 @@ impl Ctx<'_> {
                         let seg = &segs[p.seg as usize];
                         let start = self.glyphs.len() as u32;
                         for g in &seg.glyphs[p.g0 as usize..p.g1 as usize] {
-                            self.glyphs.push(PlacedGlyph { id: g.id, x: g.pen + g.dx - p.x0, y: -g.dy });
+                            // Pens count from the piece's logical start, which
+                            // is its right edge when it runs right to left.
+                            let x = if seg.rtl() { p.x0 + p.w - g.pen - g.adv } else { g.pen - p.x0 };
+                            self.glyphs.push(PlacedGlyph { id: g.id, x: x + g.dx, y: -g.dy });
                         }
                         let end = self.glyphs.len() as u32;
                         if st.color.a > 0 {
@@ -2670,12 +2937,12 @@ impl Ctx<'_> {
                         let k = fc.scale(st.font_size);
                         if st.underline {
                             let t = (fc.underline_thickness * k).max(1.0);
-                            let rect = Rect { x: fx, y: by - fc.underline_pos * k, w: f.w, h: t };
+                            let rect = Rect { x: fx, y: by - fc.underline_pos * k, w: fw, h: t };
                             self.push(DisplayItem::Rect { rect, color: st.color });
                         }
                         if st.line_through {
                             let t = (fc.strike_thickness * k).max(1.0);
-                            let rect = Rect { x: fx, y: by - fc.strike_pos * k, w: f.w, h: t };
+                            let rect = Rect { x: fx, y: by - fc.strike_pos * k, w: fw, h: t };
                             self.push(DisplayItem::Rect { rect, color: st.color });
                         }
                     }
@@ -2705,21 +2972,32 @@ impl Ctx<'_> {
         let st = &styles[b.style];
         let (mn, mx) = match &b.kind {
             Kind::Inline(items) => {
-                let atoms = self.atoms(id);
+                let inline = self.atoms(id);
+                let atoms = &inline.atoms;
                 let (mut mn, mut mx, mut line, mut word) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
                 let mut glue = false;
+                // Collapsible spaces count only once something follows them
+                // on the line, as line breaking trims them at its ends;
+                // preserved ones count (they hang at the end).
+                let mut spaces = 0.0f32;
+                let mut started = false;
                 for a in atoms.iter() {
                     match a {
                         Atom::Word(segs) => {
                             let w: f32 = segs.iter().map(|s| s.w).sum();
                             let nowrap = !styles[items[segs[0].item as usize].style()].white_space.wraps();
                             word = if glue || nowrap { word + w } else { w };
-                            line += w;
+                            line += std::mem::take(&mut spaces) + w;
+                            started = true;
                             mn = mn.max(word);
                             glue = nowrap;
                         }
-                        Atom::Space { w, can_break, .. } => {
-                            line += w;
+                        Atom::Space { w, can_break, collapsible, .. } => {
+                            if !collapsible {
+                                line += std::mem::take(&mut spaces) + w;
+                            } else if started {
+                                spaces += w;
+                            }
                             if *can_break {
                                 word = 0.0;
                                 glue = false;
@@ -2731,10 +3009,12 @@ impl Ctx<'_> {
                         Atom::Break => {
                             mx = mx.max(line);
                             line = 0.0;
+                            spaces = 0.0;
+                            started = false;
                             word = 0.0;
                             glue = false;
                         }
-                        Atom::Object { item } => {
+                        Atom::Object { item, .. } => {
                             let (omn, omx) = match &items[*item as usize] {
                                 Item::Atomic { boxid, .. } => self.intrinsic(*boxid),
                                 it @ (Item::Image { .. } | Item::Field { .. }) => {
@@ -2743,7 +3023,8 @@ impl Ctx<'_> {
                                 }
                                 _ => (0.0, 0.0),
                             };
-                            line += omx;
+                            line += std::mem::take(&mut spaces) + omx;
+                            started = true;
                             mn = mn.max(omn);
                             word = 0.0;
                             glue = false;
@@ -2904,6 +3185,7 @@ impl Breaker {
             let pieces = std::mem::take(&mut self.rest);
             let Atom::Word(segs) = &atoms[pieces[0].atom as usize] else { return None };
             if self.place_word(&mut cur, pieces, segs, avail, true) {
+                cur.wrapped = true;
                 return Some(cur);
             }
         }
@@ -2929,16 +3211,22 @@ impl Breaker {
                     // fit is everything up to the next break opportunity.
                     if self.break_ok && cur.content && cur.w + unbreakable(atoms, self.ai, w, avail - cur.w) > avail {
                         cur.trim();
+                        cur.wrapped = true;
                         return Some(cur);
                     }
                     self.ai += 1;
                     if self.place_word(&mut cur, pieces, segs, avail, wraps) {
+                        cur.wrapped = true;
                         return Some(cur);
                     }
                 }
-                Atom::Space { item, w, can_break, collapsible } => {
+                Atom::Space { item, w, can_break, collapsible, hang, level } => {
                     if !(!cur.content && *collapsible) {
-                        cur.frags.push(Frag { item: *item, x: cur.w, w: *w, kind: FragKind::Space });
+                        let kind = FragKind::Space { hang: *hang };
+                        cur.frags.push(Frag { item: *item, x: cur.w, w: *w, kind, level: *level });
+                        // An ideographic space is something on the line, even
+                        // at its start, so what follows may wrap after it.
+                        cur.content |= *hang;
                         cur.w += *w;
                     }
                     self.break_ok = *can_break;
@@ -2951,23 +3239,30 @@ impl Breaker {
                     cur.content = true;
                     return Some(cur);
                 }
-                Atom::Object { item } => {
+                Atom::Object { item, level } => {
                     let it = &items[*item as usize];
                     let (w, h, base) = ctx.object_size(it, measured[*item as usize].as_ref(), avail);
                     let wraps = styles[it.style()].white_space.wraps();
                     if (wraps || self.break_ok) && cur.content && cur.w + w > avail {
                         cur.trim();
+                        cur.wrapped = true;
                         return Some(cur);
                     }
                     self.ai += 1;
-                    cur.frags.push(Frag { item: *item, x: cur.w, w, kind: FragKind::Object { h, base } });
+                    cur.frags.push(Frag {
+                        item: *item,
+                        x: cur.w,
+                        w,
+                        kind: FragKind::Object { h, base },
+                        level: *level,
+                    });
                     cur.w += w;
                     cur.content = true;
                     self.break_ok = true;
                 }
-                Atom::Abs { item } => {
+                Atom::Abs { item, level } => {
                     self.ai += 1;
-                    cur.frags.push(Frag { item: *item, x: cur.w, w: 0.0, kind: FragKind::Abs });
+                    cur.frags.push(Frag { item: *item, x: cur.w, w: 0.0, kind: FragKind::Abs, level: *level });
                 }
             }
         }
@@ -3007,10 +3302,235 @@ fn unbreakable(atoms: &[Atom], ai: usize, w: f32, room: f32) -> f32 {
         match a {
             Atom::Word(segs) => total += segs.iter().map(|s| s.w).sum::<f32>(),
             Atom::Space { w, can_break: false, .. } => total += w,
+            Atom::Abs { .. } => {}
             _ => break,
         }
     }
     total
+}
+
+/// Bidi embedding levels of one block container's inline content, from the
+/// Unicode Bidirectional Algorithm (UAX #9) run over its text: each item's
+/// text, U+FFFC for objects, U+2029 for forced breaks and the control
+/// characters that `unicode-bidi` stands for at element boundaries.
+struct Bidi {
+    /// Where each item starts in that text.
+    starts: Vec<usize>,
+    /// The level of each byte; `None` when everything is level 0.
+    levels: Option<Vec<u8>>,
+    base: u8,
+    /// Byte offset and direction of each paragraph.
+    paras: Vec<(usize, bool)>,
+}
+
+impl Bidi {
+    fn new(items: &[Item], block: &Style) -> Bidi {
+        use unicode_bidi::{BidiClass, BidiInfo, Level};
+        let mut text = String::new();
+        if matches!(block.unicode_bidi, UnicodeBidi::Override | UnicodeBidi::IsolateOverride) {
+            text.push(if block.rtl { '\u{202E}' } else { '\u{202D}' });
+        }
+        let mut starts = Vec::with_capacity(items.len());
+        for item in items {
+            starts.push(text.len());
+            match item {
+                Item::Text { text: t, .. } => text.push_str(t),
+                Item::Break { .. } => text.push('\u{2029}'),
+                Item::Image { .. } | Item::Field { .. } | Item::Atomic { .. } => text.push('\u{FFFC}'),
+                Item::Abs { .. } => {}
+                Item::Bidi { ch, .. } => text.push(*ch),
+            }
+        }
+        let base = u8::from(block.rtl);
+        // Left-to-right text with nothing right-to-left in it, the common
+        // case, needs no reordering at all.
+        let rtl_text = text.chars().any(|c| {
+            c >= '\u{0590}'
+                && matches!(
+                    unicode_bidi::bidi_class(c),
+                    BidiClass::R | BidiClass::AL | BidiClass::AN | BidiClass::RLE | BidiClass::RLO | BidiClass::RLI
+                )
+        });
+        if !block.rtl && !rtl_text {
+            return Bidi { starts, levels: None, base, paras: vec![(0, false)] };
+        }
+        if text.len() > MAX_BIDI_BYTES {
+            return Bidi { starts, levels: Some(approximate_levels(&text, base)), base, paras: vec![(0, block.rtl)] };
+        }
+        let level = |rtl: bool| if rtl { Level::rtl() } else { Level::ltr() };
+        if block.unicode_bidi != UnicodeBidi::Plaintext {
+            let info = BidiInfo::new(&text, Some(level(block.rtl)));
+            let paras = info.paragraphs.iter().map(|p| (p.range.start, p.level.is_rtl())).collect();
+            let levels = info.levels.iter().map(|l| l.number()).collect();
+            return Bidi { starts, levels: Some(levels), base, paras };
+        }
+        // `unicode-bidi: plaintext`: each paragraph takes the direction of
+        // its first strong character; one without any keeps the direction
+        // of the one before (the block's, for the first).
+        let mut levels = Vec::with_capacity(text.len());
+        let mut paras = Vec::new();
+        let mut rtl = block.rtl;
+        for para in text.split_inclusive(['\n', '\r', '\u{85}', '\u{1C}', '\u{1D}', '\u{1E}', '\u{2029}']) {
+            rtl = match unicode_bidi::get_base_direction(para) {
+                unicode_bidi::Direction::Ltr => false,
+                unicode_bidi::Direction::Rtl => true,
+                unicode_bidi::Direction::Mixed => rtl,
+            };
+            paras.push((levels.len(), rtl));
+            levels.extend(BidiInfo::new(para, Some(level(rtl))).levels.iter().map(|l| l.number()));
+        }
+        Bidi { starts, levels: Some(levels), base, paras }
+    }
+
+    fn level(&self, pos: usize) -> u8 {
+        self.levels.as_ref().map_or(0, |l| l.get(pos).copied().unwrap_or(self.base))
+    }
+
+    /// Whether the paragraph holding byte `pos` runs right to left (the
+    /// block's direction when there is no text at all).
+    fn rtl_at(&self, pos: usize) -> bool {
+        let i = self.paras.partition_point(|&(start, _)| start <= pos);
+        i.checked_sub(1).map_or(self.base == 1, |i| self.paras[i].1)
+    }
+
+    /// The level of that paragraph, which segment separators (tabs) take.
+    fn para_level(&self, pos: usize) -> u8 {
+        if self.levels.is_none() { 0 } else { u8::from(self.rtl_at(pos)) }
+    }
+}
+
+/// Levels for paragraphs too long for the bidi algorithm: right-to-left
+/// letters get the odd level above the base, everything else the base
+/// (left-to-right letters and digits the even level above an odd base).
+/// Linear and order-preserving within each run; no embeddings, no neutrals
+/// resolution.
+fn approximate_levels(text: &str, base: u8) -> Vec<u8> {
+    use unicode_bidi::BidiClass;
+    let mut levels = Vec::with_capacity(text.len());
+    for c in text.chars() {
+        let level = match unicode_bidi::bidi_class(c) {
+            BidiClass::R | BidiClass::AL => base | 1,
+            BidiClass::L | BidiClass::EN | BidiClass::AN if base & 1 == 1 => base + 1,
+            _ => base,
+        };
+        levels.extend(std::iter::repeat_n(level, c.len_utf8()));
+    }
+    levels
+}
+
+/// Visual x of each fragment of a line, `widths` wide, for the levels they
+/// carry (UAX #9 rule L2: from the highest level down to the lowest odd
+/// one, reverse every run at that level or above). Trailing white space was
+/// trimmed already, which is what rule L1 cares about most.
+fn visual_order(frags: &[Frag], widths: &[f32]) -> Vec<f32> {
+    let max = frags.iter().map(|f| f.level).max().unwrap_or(0);
+    let min = frags.iter().map(|f| f.level).min().unwrap_or(0);
+    let lowest_odd = min | 1;
+    let mut order: Vec<usize> = (0..frags.len()).collect();
+    let mut level = max;
+    while level >= lowest_odd {
+        let mut i = 0;
+        while i < order.len() {
+            if frags[order[i]].level < level {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < order.len() && frags[order[i]].level >= level {
+                i += 1;
+            }
+            order[start..i].reverse();
+        }
+        level -= 1;
+    }
+    let mut xs = vec![0.0; frags.len()];
+    let mut x = 0.0;
+    for &i in &order {
+        xs[i] = x;
+        x += widths[i];
+    }
+    xs
+}
+
+/// `text-align: justify`: spreads `free` over the line's word spaces, or,
+/// in text without any (CJK), over its break opportunities between
+/// characters, by widening them in `widths`. Returns what it used.
+fn justify(frags: &[Frag], widths: &mut [f32], free: f32) -> f32 {
+    // Spaces before the first word don't stretch.
+    let first = frags.iter().position(|f| !matches!(f.kind, FragKind::Space { .. } | FragKind::Abs));
+    let first = first.unwrap_or(frags.len());
+    let find = |wide: bool| -> Vec<usize> {
+        let gap = |f: &Frag| matches!(f.kind, FragKind::Space { hang: false }) && (f.w > 0.0) == wide;
+        (first..frags.len()).filter(|&i| gap(&frags[i])).collect()
+    };
+    let mut gaps = find(true);
+    if gaps.is_empty() {
+        gaps = find(false);
+    }
+    if gaps.is_empty() {
+        return 0.0;
+    }
+    let each = free / gaps.len() as f32;
+    for i in gaps {
+        widths[i] += each;
+    }
+    free
+}
+
+/// Bidi formatting characters, which never draw.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Characters that belong to the cluster before them: combining marks,
+/// joiners and variation selectors.
+fn joins_cluster(c: char) -> bool {
+    matches!(c, '\u{200C}' | '\u{200D}' | '\u{FE00}'..='\u{FE0F}' | '\u{1F3FB}'..='\u{1F3FF}' | '\u{E0020}'..='\u{E01EF}')
+        || (u32::from(c) >= 0x300 && unicode_bidi::bidi_class(c) == unicode_bidi::BidiClass::NSM)
+}
+
+/// Ideographs, kana, hangul and the other characters CJK text breaks
+/// between (UAX #14 classes ID, H2, H3 and their punctuation).
+fn is_cjk(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x2E80..=0x2FFF
+            | 0x3000..=0x303F
+            | 0x3040..=0x30FF
+            | 0x3100..=0x31FF
+            | 0x3200..=0x9FFF
+            | 0xA000..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFFEF
+            | 0x20000..=0x3FFFD
+    )
+}
+
+/// Whether a line may break between `a` and `b` inside a word: around CJK
+/// characters, except before closing punctuation and small kana or after
+/// opening punctuation (a light version of the Japanese kinsoku rules).
+fn cjk_break(a: char, b: char) -> bool {
+    const NO_BREAK_BEFORE: &str = "、。，．・：；？！ー…‥）］｝」』】〉》〕〗〙〛〟’”｣､｡･ｰﾞﾟ゛゜ゝゞヽヾ々〻\
+        ぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶㇰㇱㇲㇳㇴㇵㇶㇷㇸㇹㇺㇻㇼㇽㇾㇿ〜～)]},.:;!?%'\"";
+    const NO_BREAK_AFTER: &str = "（［｛「『【〈《〔〖〘〚〝‘“｢([{'\"";
+    (is_cjk(a) || is_cjk(b))
+        && !joins_cluster(b)
+        && a != '\u{200D}'
+        && !NO_BREAK_BEFORE.contains(b)
+        && !NO_BREAK_AFTER.contains(a)
+}
+
+/// Ends a word with very many segments (thousands of inline elements
+/// without a space, or text alternating between scripts or directions at
+/// every character) with a break opportunity, so line breaking, which
+/// looks at whole words, stays linear. Hostile input only.
+fn cap_word(atoms: &mut Vec<Atom>, word: &mut Vec<Seg>, item: u32, level: u8, wraps: bool) {
+    if word.len() >= MAX_WORD_SEGS {
+        flush_word(atoms, word);
+        atoms.push(Atom::Space { item, w: 0.0, can_break: wraps, collapsible: false, hang: false, level });
+    }
 }
 
 fn flush_word(atoms: &mut Vec<Atom>, word: &mut Vec<Seg>) {
@@ -3021,8 +3541,8 @@ fn flush_word(atoms: &mut Vec<Atom>, word: &mut Vec<Seg>) {
 
 fn place_pieces(line: &mut Line, pieces: &[Piece], segs: &[Seg]) {
     for p in pieces {
-        let item = segs[p.seg as usize].item;
-        line.frags.push(Frag { item, x: line.w, w: p.w, kind: FragKind::Text(*p) });
+        let seg = &segs[p.seg as usize];
+        line.frags.push(Frag { item: seg.item, x: line.w, w: p.w, kind: FragKind::Text(*p), level: seg.level });
         line.w += p.w;
         line.content = true;
     }

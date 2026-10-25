@@ -48,6 +48,9 @@ pub(super) struct Pending {
     pub id: BoxId,
     pub x: f32,
     pub y: f32,
+    /// Where its margin box would have ended, when the static position's
+    /// containing block runs right to left (the box then hangs from there).
+    pub right: Option<f32>,
     pub seq: usize,
 }
 
@@ -135,12 +138,16 @@ impl Ctx<'_> {
     }
 
     pub(super) fn add_pending(&mut self, id: BoxId, x: f32, y: f32) {
+        self.add_pending_rtl(id, x, y, None);
+    }
+
+    pub(super) fn add_pending_rtl(&mut self, id: BoxId, x: f32, y: f32, right: Option<f32>) {
         let seq = self.pending_seq;
         self.pending_seq += 1;
         let fixed = self.styles[self.boxes[id].style].position == Position::Fixed;
         let frame = if fixed { self.abs.first_mut() } else { self.abs.last_mut() };
         if let Some(frame) = frame {
-            frame.push(Pending { id, x, y, seq });
+            frame.push(Pending { id, x, y, right, seq });
         }
     }
 
@@ -205,10 +212,12 @@ impl Ctx<'_> {
         let (outer_h, _, span) = self.layout_detached(p.id, bw, cb.w, fixed_h);
         self.cb_h = saved;
         let bh = (outer_h - mt - mb).max(0.0);
+        // Over-constrained, `left` gives in a right-to-left box.
         let bx = match (left, right) {
+            (Some(_), Some(r)) if st.rtl => cb.x + cb.w - r - mr - bw,
             (Some(l), _) => cb.x + l + ml,
             (None, Some(r)) => cb.x + cb.w - r - mr - bw,
-            (None, None) => p.x + ml,
+            (None, None) => p.right.map_or(p.x + ml, |r| r - mr - bw),
         };
         let by = match (top, bottom) {
             (Some(t), _) => cb.y + t + mt,
@@ -225,7 +234,9 @@ impl Ctx<'_> {
     pub(super) fn relative_offset(&self, st: &Style, cb_w: f32) -> (f32, f32) {
         let def = |i: usize, basis: f32| st.inset[i].is_definite().then(|| st.inset[i].resolve(basis));
         let cb_h = self.cb_h.unwrap_or(0.0);
-        let dx = def(3, cb_w).or(def(1, cb_w).map(|r| -r)).unwrap_or(0.0);
+        let (left, right) = (def(3, cb_w), def(1, cb_w).map(|r| -r));
+        // With both given, the containing block's direction says which wins.
+        let dx = if self.cb_rtl { right.or(left) } else { left.or(right) }.unwrap_or(0.0);
         let dy = def(0, cb_h).or(def(2, cb_h).map(|b| -b)).unwrap_or(0.0);
         (dx, dy)
     }

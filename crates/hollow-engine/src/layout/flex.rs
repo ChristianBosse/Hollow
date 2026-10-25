@@ -55,6 +55,10 @@ impl Ctx<'_> {
         let st = &styles[boxes[id].style];
         let row = st.is_row();
         let reverse = matches!(st.flex_direction, FlexDirection::RowReverse | FlexDirection::ColumnReverse);
+        // In right-to-left text a row starts at the right, and a column's
+        // cross axis does too.
+        let flip_main = if row { reverse != st.rtl } else { reverse };
+        let flip_cross = !row && st.rtl;
         let gap = |l: Len, basis: f32| l.resolve(basis).max(0.0);
         let (gap_main, gap_cross) = if row {
             (gap(st.gap[1], w), gap(st.gap[0], height.unwrap_or(0.0)))
@@ -200,22 +204,22 @@ impl Ctx<'_> {
             let mut pos = lead;
             let lc = line_cross[li];
             for it in &mut items[line.clone()] {
-                let (ms, me, auto_s, auto_e) = if row {
-                    (it.margin[3], it.margin[1], it.auto[3], it.auto[1])
-                } else {
-                    (it.margin[0], it.margin[2], it.auto[0], it.auto[2])
+                let (ms, me, auto_s, auto_e) = match (row, flip_main) {
+                    (true, false) => (it.margin[3], it.margin[1], it.auto[3], it.auto[1]),
+                    (true, true) => (it.margin[1], it.margin[3], it.auto[1], it.auto[3]),
+                    (false, _) => (it.margin[0], it.margin[2], it.auto[0], it.auto[2]),
                 };
                 pos += ms + if auto_s { auto_extra } else { 0.0 };
                 let mut main_pos = pos;
                 pos += it.main + me + if auto_e { auto_extra } else { 0.0 } + gap_main + between;
-                if reverse {
+                if flip_main {
                     main_pos = avail - main_pos - it.main;
                 }
                 // Cross axis.
-                let (cs, ce, cauto_s, cauto_e) = if row {
-                    (it.margin[0], it.margin[2], it.auto[0], it.auto[2])
-                } else {
-                    (it.margin[3], it.margin[1], it.auto[3], it.auto[1])
+                let (cs, ce, cauto_s, cauto_e) = match (row, flip_cross) {
+                    (true, _) => (it.margin[0], it.margin[2], it.auto[0], it.auto[2]),
+                    (false, false) => (it.margin[3], it.margin[1], it.auto[3], it.auto[1]),
+                    (false, true) => (it.margin[1], it.margin[3], it.auto[1], it.auto[3]),
                 };
                 if it.align == Align::Stretch && it.cross_auto && !cauto_s && !cauto_e && row {
                     let target = self.clamp_cross(it.id, (lc - cs - ce).max(0.0), row, w);
@@ -236,7 +240,10 @@ impl Ctx<'_> {
                         _ => 0.0,
                     },
                 };
-                let cross_at = cross_pos + off + cs;
+                let mut cross_at = cross_pos + off + cs;
+                if flip_cross {
+                    cross_at = w - cross_at - it.cross;
+                }
                 let (bx, by) = if row { (x + main_pos, y + cross_at) } else { (x + cross_at, y + main_pos) };
                 // Laid out at the origin, border box at (margin-left, margin-top).
                 let (dx, dy) = (bx - it.margin[3], by - it.margin[0]);
