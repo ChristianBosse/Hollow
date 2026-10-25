@@ -1122,3 +1122,212 @@ fn inline_svg_icons_use_page_symbols_and_current_color() {
     let f = layout(&html, 100.0).paint(0.0, 40.0, 1.0);
     assert_eq!(pixel(&f, 10, 10), [0, 0, 255, 255], "the symbol from the hidden sprite, in the text color");
 }
+
+// ---------------------------------------------------------------------------
+// Font fallback and bidi
+
+/// Mean x of the pixels in exactly this color, if any.
+fn color_x(f: &Frame, rgb: [u8; 3]) -> Option<f32> {
+    let (mut sum, mut n) = (0u64, 0u64);
+    for (i, p) in f.rgba.chunks(4).enumerate() {
+        if p[..3] == rgb {
+            sum += (i as u32 % f.width) as u64;
+            n += 1;
+        }
+    }
+    (n > 0).then(|| sum as f32 / n as f32)
+}
+
+/// Link areas grouped into lines: each line's y and its glyph boxes
+/// (x, right edge), skipping zero-width ones.
+fn link_rows(l: &Layout) -> Vec<(i32, Vec<(f32, f32)>)> {
+    let mut rows: std::collections::BTreeMap<i32, Vec<(f32, f32)>> = Default::default();
+    for a in l.links().iter().filter(|a| a.width > 0.0) {
+        rows.entry(a.y as i32).or_default().push((a.x, a.x + a.width));
+    }
+    rows.into_iter().collect()
+}
+
+/// Leftmost and rightmost column with ink.
+fn ink_span(f: &Frame) -> Option<(u32, u32)> {
+    let cols: Vec<u32> = (0..f.width).filter(|&x| ink(f, x, 0, x + 1, f.height) > 0).collect();
+    Some((*cols.first()?, *cols.last()?))
+}
+
+#[test]
+fn cjk_text_wraps_between_ideographs() {
+    let text = "日本語の文章は単語の間に空白を入れない".repeat(4);
+    let html = format!("<div style='width:200px;font-size:20px;line-height:30px'><a href=/j>{text}</a></div>");
+    let l = layout(&format!("{PLAIN}{html}"), 400.0);
+    let rows = link_rows(&l);
+    assert!(rows.len() >= 7, "{} lines", rows.len());
+    // Full lines that never overflow: breaks come between ideographs.
+    let full = &rows[..rows.len() - 1];
+    assert!(full.iter().all(|r| r.1.len() == 10 && r.1[9].1 <= 200.0 + 0.01), "{rows:?}");
+    // And the glyphs are real ideographs, not missing-glyph boxes: a box
+    // has the same ink for every character.
+    let a = frame("<span style='font-size:40px'>日</span>", 100.0, 60.0);
+    let b = frame("<span style='font-size:40px'>本</span>", 100.0, 60.0);
+    assert!(ink(&a, 0, 0, 100, 60) > 50);
+    assert_ne!(a.rgba, b.rgba);
+}
+
+#[test]
+fn kinsoku_keeps_closing_punctuation_on_the_line() {
+    // Each line holds five ideographs; the full stop may not start a line.
+    let html = "<div style='width:100px;font-size:20px;font-family:sans-serif'>\
+                <a href=/a>一二三四五</a><a href=/b>。</a></div>";
+    let rows = link_rows(&layout(&format!("{PLAIN}{html}"), 400.0));
+    // The last ideograph went down with the full stop.
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].1.len(), 4, "{rows:?}");
+    assert_eq!(rows[1].1.len(), 2, "{rows:?}");
+}
+
+#[test]
+fn arabic_letters_join() {
+    let joined = frame("<span style='font-size:40px'>\u{0628}\u{0628}\u{0628}\u{0628}\u{0628}</span>", 600.0, 80.0);
+    let single = frame("<span style='font-size:40px'>\u{0628}</span>", 600.0, 80.0);
+    let (j0, j1) = ink_span(&joined).unwrap();
+    let (s0, s1) = ink_span(&single).unwrap();
+    assert!((j1 - j0) < 5 * (s1 - s0) * 3 / 4, "joined {} vs isolated {}", j1 - j0, s1 - s0);
+    // In serif text too, where the letters come from the fallback font.
+    let serif =
+        frame("<span style='font-size:40px;font-family:serif'>\u{0628}\u{0628}\u{0628}\u{0628}</span>", 600.0, 80.0);
+    let one = frame("<span style='font-size:40px;font-family:serif'>\u{0628}</span>", 600.0, 80.0);
+    let (a0, a1) = ink_span(&serif).unwrap();
+    let (b0, b1) = ink_span(&one).unwrap();
+    assert!((a1 - a0) < 4 * (b1 - b0) * 3 / 4, "joined {} vs isolated {}", a1 - a0, b1 - b0);
+}
+
+#[test]
+fn mixed_directions_reorder() {
+    // Logical order red, green, blue: the Hebrew between the English words
+    // reads right to left, so blue paints leftmost.
+    let html = "<p style='margin:0;font-size:30px'>abc <span style='color:#ff0000'>\u{05D0}</span>\
+                <span style='color:#00ff00'>\u{05D1}</span><span style='color:#0000ff'>\u{05D2}</span> def</p>";
+    let f = frame(html, 600.0, 60.0);
+    let r = color_x(&f, [255, 0, 0]).unwrap();
+    let g = color_x(&f, [0, 255, 0]).unwrap();
+    let b = color_x(&f, [0, 0, 255]).unwrap();
+    assert!(b < g && g < r, "{b} {g} {r}");
+    // `abc` stays left of the Hebrew and `def` right of it.
+    let html = "<p style='margin:0;font-size:30px'><span style='color:#ff0000'>abc</span> \u{05D0}\u{05D1}\u{05D2} \
+                <span style='color:#0000ff'>def</span></p>";
+    let f = frame(html, 600.0, 60.0);
+    assert!(color_x(&f, [255, 0, 0]).unwrap() < color_x(&f, [0, 0, 255]).unwrap());
+    // In a right-to-left paragraph the words run right to left, the
+    // English word keeping its own order inside.
+    let html = "<p dir=rtl style='margin:0;font-size:30px'><span style='color:#ff0000'>\u{05D0}\u{05D1}</span> \
+                <span style='color:#00ff00'>ab</span><span style='color:#0000ff'>cd</span></p>";
+    let f = frame(html, 600.0, 60.0);
+    let r = color_x(&f, [255, 0, 0]).unwrap();
+    let g = color_x(&f, [0, 255, 0]).unwrap();
+    let b = color_x(&f, [0, 0, 255]).unwrap();
+    assert!(g < b && b < r, "{g} {b} {r}");
+    // `<bdo dir=rtl>` reverses even Latin letters.
+    let html = "<p style='margin:0;font-size:30px'><bdo dir=rtl><span style='color:#ff0000'>a</span>\
+                <span style='color:#0000ff'>b</span></bdo></p>";
+    let f = frame(html, 600.0, 60.0);
+    assert!(color_x(&f, [0, 0, 255]).unwrap() < color_x(&f, [255, 0, 0]).unwrap());
+}
+
+#[test]
+fn rtl_paragraphs_align_right() {
+    for html in [
+        "<p dir=rtl style='margin:0'>abc</p>",
+        "<div style='direction:rtl'><p style='margin:0'>\u{05D0}\u{05D1}\u{05D2}</p></div>",
+        "<p dir=auto style='margin:0'>\u{05D0}\u{05D1}\u{05D2} abc</p>",
+    ] {
+        let f = frame(html, 400.0, 30.0);
+        assert_eq!(ink(&f, 0, 0, 300, 30), 0, "{html}");
+        assert!(ink(&f, 300, 0, 400, 30) > 20, "{html}");
+    }
+    // `dir=auto` with English first stays left to right, and an explicit
+    // `text-align` still wins.
+    for html in [
+        "<p dir=auto style='margin:0'>abc \u{05D0}\u{05D1}\u{05D2}</p>",
+        "<p dir=rtl style='margin:0;text-align:left'>abc</p>",
+    ] {
+        let f = frame(html, 400.0, 30.0);
+        assert!(ink(&f, 0, 0, 100, 30) > 20, "{html}");
+        assert_eq!(ink(&f, 200, 0, 400, 30), 0, "{html}");
+    }
+}
+
+#[test]
+fn emoji_and_other_scripts_are_not_missing_glyph_boxes() {
+    // Every character a bundled font lacks draws the same box.
+    let missing = frame("<span style='font-size:40px'>\u{10FFFD}</span>", 100.0, 60.0);
+    for text in ["😀", "🎉", "👍🏽", "\u{05D0}", "\u{0915}", "\u{0E01}", "\u{D55C}", "\u{3042}"] {
+        let f = frame(&format!("<span style='font-size:40px'>{text}</span>"), 100.0, 60.0);
+        assert!(ink(&f, 0, 0, 100, 60) > 30, "{text:?} draws");
+        assert_ne!(f.rgba, missing.rgba, "{text:?} is not a missing glyph");
+    }
+    // Fallback glyphs sit on the line without making it taller.
+    let latin = layout(&format!("{PLAIN}<p style='margin:0'>abc</p>"), 300.0).height();
+    let mixed =
+        layout(&format!("{PLAIN}<p style='margin:0'>abc 😀 中文 \u{0628}\u{0628} \u{0E01}</p>"), 300.0).height();
+    assert_eq!(latin, mixed);
+}
+
+#[test]
+fn hostile_bidi_stays_fast() {
+    let mixed = "abc \u{05D0}\u{05D1}\u{05D2} 123 \u{0627}\u{0644}\u{0639} (x) ".repeat(40_000);
+    let inputs: Vec<String> = vec![
+        format!("<p dir=rtl>{mixed}</p>"),
+        format!("<p>{}</p>", "\u{05D0}\u{202E}a\u{202B}b\u{2067}c".repeat(50_000)),
+        format!("<p>{}</p>", "<bdi>\u{05D0}</bdi><bdo dir=rtl>a</bdo>".repeat(20_000)),
+        format!("<p>{}</p>", "<span dir=rtl>\u{05D0}(".repeat(250) + &"]a</span>".repeat(250)),
+        format!("<pre dir=auto>{}</pre>", "\u{05D0} abc\n".repeat(50_000)),
+        format!("<p style='unicode-bidi:plaintext'>{}</p>", "a<br>\u{05D0}<br>".repeat(20_000)),
+        format!("<p>{}</p>", "中".repeat(200_000)),
+        // One word alternating direction (or font) at every character, and
+        // one made of thousands of elements.
+        format!("<p>{}</p>", "x\u{05D0}".repeat(300_000)),
+        format!("<p style='font-family:serif'>{}</p>", "a\u{0628}".repeat(300_000)),
+        format!("<p>{}</p>", "<b>x</b>".repeat(100_000)),
+    ];
+    let start = std::time::Instant::now();
+    for html in &inputs {
+        let l = layout(html, 800.0);
+        assert!(l.height().is_finite() && l.height() > 0.0);
+        let f = l.paint(0.0, 600.0, 1.0);
+        assert!(ink(&f, 0, 0, f.width, f.height) > 0);
+    }
+    // Generous for debug builds; release takes well under a second.
+    assert!(start.elapsed().as_secs() < 60, "{:?}", start.elapsed());
+}
+
+#[test]
+fn justify_indent_and_rtl_boxes() {
+    // Justified lines end at the right edge; the last line does not.
+    let words: String = (0..30).map(|i| format!("<a href=/w{i}>w{i}</a> ")).collect();
+    let l = layout(&format!("{PLAIN}<p style='margin:0;width:300px;text-align:justify'>{words}</p>"), 400.0);
+    let rows = link_rows(&l);
+    assert!(rows.len() > 2);
+    for (i, (_, row)) in rows.iter().enumerate() {
+        let end = row.last().unwrap().1;
+        if i + 1 < rows.len() {
+            assert!((end - 300.0).abs() < 0.5, "line {i} ends at {end}");
+        } else {
+            assert!(end < 290.0, "the last line is start-aligned: {end}");
+        }
+    }
+    // `text-indent` moves the first line in from the start side.
+    let html = "<p style='margin:0;text-indent:50px'><a href=/a>abc</a></p>";
+    assert_eq!(link_rows(&layout(&format!("{PLAIN}{html}"), 400.0))[0].1[0].0, 50.0);
+    let html = "<p dir=rtl style='margin:0;text-indent:50px'><a href=/a>abc</a></p>";
+    let end = link_rows(&layout(&format!("{PLAIN}{html}"), 400.0))[0].1[0].1;
+    assert!((end - 350.0).abs() < 0.01, "{end}");
+    // In a right-to-left block, a narrower child sits at the right and a
+    // flex row starts at the right.
+    let f = frame("<div dir=rtl><div style='width:100px;height:10px;background:#0000ff'></div></div>", 400.0, 20.0);
+    assert_eq!(pixel(&f, 350, 5), BLUE);
+    assert_eq!(pixel(&f, 50, 5), WHITE);
+    let html = "<div dir=rtl style='display:flex'><div style='width:50px;height:10px;background:#ff0000'></div>\
+                <div style='width:50px;height:10px;background:#0000ff'></div></div>";
+    let f = frame(html, 400.0, 20.0);
+    assert_eq!(pixel(&f, 375, 5), RED);
+    assert_eq!(pixel(&f, 325, 5), BLUE);
+}

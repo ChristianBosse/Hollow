@@ -7,6 +7,8 @@
 //! control's contents right after its marker, so they keep the control's
 //! place in the paint order and its clip. Typing never relays out the page.
 
+use std::ops::Range;
+
 use crate::css::Color;
 use crate::dom::NodeId;
 use crate::form::{Control, Forms, TextKind};
@@ -129,27 +131,40 @@ impl Pen<'_> {
         (self.out.clip_rects.len() - 1) as u32
     }
 
-    /// Shapes `s` and returns its glyph range and width in CSS px.
-    fn glyphs(&mut self, s: &str, f: FieldStyle) -> (std::ops::Range<u32>, f32) {
-        let Some(face) = text::face(f.face) else { return (0..0, 0.0) };
-        let k = face.scale(f.size);
-        let shaped = self.shaper.shape(f.face, s);
-        let start = self.out.glyphs.len() as u32;
-        for g in &shaped.glyphs {
-            self.out.glyphs.push(PlacedGlyph { id: g.id, x: (g.pen + g.dx) as f32 * k, y: -(g.dy as f32) * k });
+    /// Shapes `s` in the faces that draw it (see [`text::face_runs`]). Each
+    /// run goes left to right in the field, a right-to-left word reading
+    /// right to left within itself; fields get no full bidi reordering.
+    /// Calls `each` with each run's face, glyph range and x, and returns
+    /// the total width in CSS px.
+    fn shape(&mut self, s: &str, f: FieldStyle, mut each: impl FnMut(&mut Self, FaceId, Range<u32>, f32)) -> f32 {
+        let mut x = 0.0;
+        for (range, face_id) in text::face_runs(f.face, s) {
+            let Some(face) = text::face(face_id) else { continue };
+            let k = face.scale(f.size);
+            let run = &s[range];
+            let shaped = self.shaper.shape(face_id, run, text::guess_rtl(run));
+            let start = self.out.glyphs.len() as u32;
+            for g in &shaped.glyphs {
+                self.out.glyphs.push(PlacedGlyph { id: g.id, x: shaped.x(g) as f32 * k, y: -(g.dy as f32) * k });
+            }
+            each(self, face_id, start..self.out.glyphs.len() as u32, x);
+            x += shaped.advance as f32 * k;
         }
-        (start..self.out.glyphs.len() as u32, shaped.advance as f32 * k)
+        x
     }
 
     fn width(&mut self, s: &str, f: FieldStyle) -> f32 {
-        let Some(face) = text::face(f.face) else { return 0.0 };
-        self.shaper.shape(f.face, s).advance as f32 * face.scale(f.size)
+        let start = self.out.glyphs.len();
+        let w = self.shape(s, f, |_, _, _, _| {});
+        self.out.glyphs.truncate(start);
+        w
     }
 
     fn text(&mut self, s: &str, f: FieldStyle, x: f32, baseline: f32, clip: u32) -> f32 {
-        let (glyphs, w) = self.glyphs(s, f);
-        self.push(DisplayItem::Text { face: f.face, size: f.size, color: f.color, x, y: baseline, glyphs }, clip);
-        w
+        self.shape(s, f, |pen, face, glyphs, dx| {
+            let item = DisplayItem::Text { face, size: f.size, color: f.color, x: x + dx, y: baseline, glyphs };
+            pen.push(item, clip);
+        })
     }
 
     fn field(&mut self, forms: &Forms, rect: Rect, node: NodeId, kind: FieldKind, f: FieldStyle, clip: u32) {

@@ -62,7 +62,7 @@ target/release/hollow.exe fetch https://check.torproject.org/
 
 ## License
 
-GPL-3.0-or-later; the full text is in [LICENSE](LICENSE). Small standalone libraries may be MIT/Apache-2.0 so other projects can adopt them. Vendored crates in `third_party/` keep their own licenses (MIT OR Apache-2.0), and the bundled DejaVu fonts are under the license in `crates/hollow-engine/fonts/`. "Hollow" is intended to be a registered trademark, so forks must use a different name.
+GPL-3.0-or-later; the full text is in [LICENSE](LICENSE). Small standalone libraries may be MIT/Apache-2.0 so other projects can adopt them. Vendored crates in `third_party/` keep their own licenses (MIT OR Apache-2.0), and the bundled fonts (DejaVu, Noto Sans and Noto Emoji, Nanum Gothic under the OFL, Droid Sans Fallback under Apache-2.0) are under the licenses next to them in `crates/hollow-engine/fonts/`. "Hollow" is intended to be a registered trademark, so forks must use a different name.
 
 ## Developer checks
 

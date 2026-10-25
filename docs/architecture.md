@@ -138,14 +138,29 @@ bytes ─► html5ever ─► DOM ─► CSS (Stylo or own) ─► layout ─►
 | HTML parsing | `html5ever` | Spec-compliant, from Servo |
 | CSS | `stylo` (from Servo/Firefox) or our own | Stylo gives Firefox-like behavior, which helps Tor Browser mimicry |
 | Layout | Our own (block, inline, tables, flexbox, floats, positioning) | Fortress v0 uses its own CSS and layout in `hollow-engine`; grid is still to come |
-| Fonts | `skrifa` / `read-fonts` (fontations) | Memory-safe font parsing. Bundled fonts only; web fonts come later behind the Rust parser |
-| Text shaping | `rustybuzz` | Rust port of HarfBuzz |
+| Fonts | `skrifa` / `read-fonts` (fontations) | Memory-safe font parsing. Bundled fonts only (see below); web fonts come later behind the Rust parser |
+| Text shaping | `harfrust` | Rust port of HarfBuzz; bidi with `unicode-bidi` (UAX #9) |
 | Raster | `tiny-skia` | Software rasterizer |
 | Images | `image`, `zune-jpeg`, `png` | Optional separate decode process |
 | AV1 video | `rav1d` | Later |
 | SVG | `usvg` / `resvg` | Static only, no scripts or SMIL |
 
 **Determinism rules:** no platform `libm` (use the `libm` crate), no fused multiply-add unless explicit, no system fonts, no GPU, fixed DPI, window sizes snapped to standard steps (letterboxing).
+
+**Bundled fonts** (MODE-04, FP-01). The engine never reads a font from the system: every face is compiled in with `include_bytes!` from `crates/hollow-engine/fonts/` (licenses next to them), so text measures and draws the same everywhere and a page can't probe what is installed. CSS `font-family` picks one of the DejaVu families (the `dejavu` crate: Sans, Serif, Mono, each regular/bold/italic). A character the chosen face lacks falls back through one fixed chain, the same for every page and machine: the page's face, then Noto Sans Hebrew, Noto Sans Arabic, Noto Sans Devanagari, Noto Sans Thai (regular or bold, following the text), DejaVu Sans (its coverage is wider than Serif's and Mono's), Droid Sans Fallback (CJK ideographs, kana, bopomofo), Nanum Gothic (hangul), Noto Emoji (monochrome outlines; emoji-plane characters and `U+FE0F` sequences prefer it). Text is split into runs by face (combining marks, joiners and emoji modifiers stay with their base) and each run is shaped with its own font; line height always comes from the page's face, so a fallback glyph never makes a line taller.
+
+| Font | License | Size |
+|---|---|---|
+| Noto Sans Hebrew Regular + Bold | OFL 1.1 | 34 KB |
+| Noto Sans Arabic Regular + Bold | OFL 1.1 | 284 KB |
+| Noto Sans Devanagari Regular + Bold | OFL 1.1 | 368 KB |
+| Noto Sans Thai Regular + Bold | OFL 1.1 | 42 KB |
+| Droid Sans Fallback (Full) | Apache 2.0 | 4.0 MB |
+| Nanum Gothic Regular | OFL 1.1 | 2.1 MB |
+| Noto Emoji (variable, default instance) | OFL 1.1 | 2.0 MB |
+| **Total added** | | **8.8 MB** |
+
+CJK and hangul have regular faces only (bold text uses them unchanged); there is no color emoji. Thai and other scripts without spaces break only at spaces (no dictionary).
 
 **Forms** work fully without JS (GET/POST). **Rebuild mode** extracts the readable content of pages that arrive empty without JS.
 
