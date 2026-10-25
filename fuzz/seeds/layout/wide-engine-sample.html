@@ -1,0 +1,78 @@
+ÿp<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Hollow Fortress engine sample</title>
+<link rel="stylesheet" href="https://example.org/static/sample.css">
+<script>document.write("this must never appear");</script>
+<style>
+  body { font-family: "Helvetica Neue", Arial, sans-serif; max-width: 760px; margin: 0 auto; padding: 0 16px; color: #222; }
+  nav a { margin-left: 12px; }
+  h1 { font-family: Georgia, serif; font-size: 2.2em; margin-bottom: 0.2em; }
+  .lede { font-size: 1.15em; color: #555; }
+  .note { background: #fff6d6; padding: 8px 12px; margin: 16px 0; }
+  a.btn { background-color: #0a7d3b; color: white; text-decoration: none; padding: 2px 6px; }
+  #promo { display: none; }
+  blockquote { color: #444; font-style: italic; margin-left: 24px; }
+  pre { background: #f2f2f2; padding: 10px; }
+  table.data { width: 100%; }
+  table.data th { background-color: #e3e9ef; text-align: left; padding: 4px 8px; }
+  table.data td { padding: 4px 8px; }
+  tr.odd td { background-color: #f7f7f7; }
+  footer { color: #777; font-size: 0.85em; text-align: center; margin: 32px 0 16px; }
+  @media (max-width: 600px) { body { font-size: 20px } }
+  p:hover { color: red }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand"><a href="/">Hollow</a></span>
+  <nav><a href="/news">News</a> <a href="/docs">Docs</a> <a href="/about">About</a></nav>
+</header>
+
+<h1>Rendering without JavaScript</h1>
+<p class="layout-hint"><span class="wide">This line comes from an @media (min-width: 700px) rule in a linked stylesheet.</span><span class="narrow">Narrow layout: the linked stylesheet's @media rule did not match.</span></p>
+<p class="lede">Fortress mode turns HTML and CSS into pixels on the CPU, with fonts compiled into the
+browser, so every computer produces the <em>same</em> image.</p>
+
+<div id="promo">This promotional banner is hidden with <code>display: none</code>.</div>
+
+<p>Hollow is a privacy browser written in Rust. Pages are parsed with <a href="https://github.com/servo/html5ever">html5ever</a>,
+styled by a small cascade, laid out in blocks and lines, shaped with <b>HarfRust</b> and rasterized by
+<i>tiny-skia</i>. Long words such as <code>DonaudampfschifffahrtsgesellschaftskapitÃ¤n</code> still wrap, and
+<a class="btn" href="/download">Download</a> buttons keep their colors.</p>
+
+<img src="https://example.org/static/banner.png" alt="A banner" width="320" height="120">
+
+<div class="note"><strong>Note:</strong> scripts are dropped while parsing &mdash; there is nothing to run them
+with. <noscript>This noscript text is shown, because Fortress has no JavaScript.</noscript></div>
+
+<h2>What works</h2>
+<ul>
+  <li>Block and inline layout with margin collapsing</li>
+  <li>Lists, including nested ones:
+    <ol>
+      <li>Ordered items</li>
+      <li>With <u>underlined</u> and <s>struck</s> text</li>
+    </ol>
+  </li>
+  <li>Tables with automatic column widths</li>
+</ul>
+
+<blockquote>&ldquo;Nothing to see. Nothing to take.&rdquo;</blockquote>
+
+<pre>fn main() {
+    println!("preformatted text keeps    its spaces");
+}</pre>
+
+<table class="data">
+  <tr><th>Stage</th><th>Crate</th><th>Notes</th></tr>
+  <tr class="odd"><td>Parsing</td><td>html5ever</td><td>Scripting disabled, so noscript is real markup</td></tr>
+  <tr><td>Shaping</td><td>harfrust</td><td>Per word, cached</td></tr>
+  <tr class="odd"><td>Raster</td><td>tiny-skia</td><td>CPU only, deterministic</td></tr>
+</table>
+
+<hr>
+<footer>Rendered by hollow-engine &middot; <a href="/source">source</a></footer>
+</body>
+</html>

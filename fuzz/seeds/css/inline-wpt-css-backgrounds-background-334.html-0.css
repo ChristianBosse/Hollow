@@ -1,0 +1,16 @@
+
+        #ref {
+            background-color: red;
+            height: 160px;
+            width: 160px;
+        }
+        #test {
+            background: #CCC url(support/60x60-green.png) top left / 100% auto no-repeat;
+            border: black dotted 5px;
+            bottom: 160px;
+            height: 100px;
+            padding: 25px;
+            position: relative;
+            width: 100px;
+        }
+    

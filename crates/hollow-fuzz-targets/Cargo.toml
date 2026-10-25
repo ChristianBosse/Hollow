@@ -1,0 +1,17 @@
+[package]
+name = "hollow-fuzz-targets"
+description = "Fuzz targets for every Hollow parser, shared by fuzz/ (libFuzzer) and `cargo xtask fuzz` (SEC-07)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hollow-app = { path = "../hollow-app" }
+hollow-engine.workspace = true
+hollow-ipc.workspace = true
+hollow-net = { path = "../hollow-net" }
+url = "2.5.8"

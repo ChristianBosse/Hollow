@@ -1,0 +1,21 @@
+
+			body {margin: 8px;}
+            #table
+            {
+                display: table;
+                table-layout: fixed;
+            }
+            #row
+            {
+                display: table-row;
+            }
+            #cell
+            {
+                background: green;
+                bottom: 0;
+                display: table-cell;
+                height: 100px;
+                position: absolute;
+                width: 100px;
+            }
+        

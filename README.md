@@ -39,7 +39,8 @@ target/release/hollow.exe fetch https://check.torproject.org/
 | `hollow-net` | `hollow-net.exe` | The only process with sockets: Arti (Tor), rustls, HTTP |
 | `hollow-fortress` | `hollow-fortress.exe` | Renderer: no network, LPAC, Win32k lockdown, ACG, CIG, one process per page |
 | `hollow-engine` | — | Fortress engine: HTML + CSS subset → layout → pixels, CPU-only, bundled fonts, deterministic |
-| `xtask` | — | Developer checks: `dist`, `repro-check`, `leak-test`, `trace-test`, `wpt` |
+| `xtask` | — | Developer checks: `dist`, `repro-check`, `leak-test`, `trace-test`, `wpt`, `fuzz` |
+| `hollow-fuzz-targets` | — | One fuzz target per parser, shared by `cargo xtask fuzz` and the cargo-fuzz project in `fuzz/` |
 | `hollow-ipc` | — | Message types, framing, size limits, validation |
 | `hollow-sandbox` | — | AppContainer/LPAC launch, mitigation policies, job objects (the only crate with `unsafe`) |
 
@@ -75,6 +76,7 @@ GPL-3.0-or-later; the full text is in [LICENSE](LICENSE). Small standalone libra
 | `cargo xtask leak-test` | Runs `hollow fetch https://check.torproject.org/` and polls the TCP/UDP tables with owning PIDs every ~10 ms (P1, host edition of TRUST-06) | `hollow.exe` or `hollow-fortress.exe` owns any socket; `hollow-net.exe` owns a UDP or listening socket or connects to anything but a Tor relay ORPort, an Arti fallback dir or a directory authority; the fetch fails; the page doesn't say "Congratulations" |
 | `cargo xtask trace-test` | Snapshots files, the HKCU registry and the ACLs of the binaries before and after `hollow fetch https://check.torproject.org/`, and polls Hollow's AppContainer state while it runs (P5, host edition) | Anything new or changed matches Hollow's names, Arti's files or Hollow's AppContainer SIDs; a new AppContainer profile (`%LOCALAPPDATA%\Packages`, registry `Mappings`/`Storage`) is left; an ACE for a Hollow SID remains, or any ACE was added, on `hollow*.exe` or their folder; `%SystemRoot%\hollow-ram-only-never-created` exists; Hollow writes into its working directory; no Hollow profile was seen during the session; the fetch fails; no "Congratulations" |
 | `cargo xtask wpt` | Runs the Web Platform Tests reftests in `target/wpt` with the engine in-process at 800x600 (see below) | A test listed in `tests/wpt/expected.txt` no longer passes |
+| `cargo xtask fuzz` | Mutation-fuzzes every parser's fuzz target with the stable toolchain (SEC-07, see below) | Any input panics, runs over the per-input time budget, takes the process over the memory limit or kills it |
 
 `dist`, `repro-check`, `leak-test` and `trace-test` pass `--locked` to cargo (`--unlocked` to allow `Cargo.lock` updates). `leak-test` and `trace-test` take `--url`, `--timeout <secs>`, `--no-build` (reuse `target/dist`) and `--bin-dir <dir>`.
 
@@ -131,3 +133,35 @@ Limits, also printed on every run:
 Options: `--filter <path prefix>` (e.g. `css/CSS2/floats`; `--update` then only touches that part of `expected.txt`), `--jobs <n>`, `--save <dir>` (PNGs of each failing test and its reference), `--compare <dir>` (per-area pass rates next to browsers' wpt.fyi summary files `<browser>.json` in `<dir>`, on the tests every browser ran). Full results go to `target/wpt-results.json`.
 
 How tests are run: pages are served from the checkout as `http://web-platform.test/<path>`, so relative and root-relative stylesheets and images load. A test passes if it matches one of its `rel=match` references and none of its `rel=mismatch` ones, in the top 800x600 CSS px. Without a `<meta name=fuzzy>`, a match allows up to 40 pixels whose channels differ by more than 8 (the engine's antialiasing is not a browser's); with one, its ranges are checked as wptrunner does. `.xht`/`.xhtml`/`.xml` files go through a pre-pass for what the HTML parser does differently from XML (CDATA, `<div/>`, `</br>`, `<?xml-stylesheet?>`), but implied elements and case sensitivity still differ. Tests with `<script>`, `class=reftest-wait` or a missing reference, and print reftests, are skipped and counted. Each test has 20 s; a slower one is recorded as a timeout and its worker replaced. The `Ahem` test font is registered through hollow-engine's non-default `test-fonts` feature, which only xtask enables; Hollow itself only ever uses the bundled fonts.
+
+### Fuzzing
+
+Every parser that reads untrusted bytes has a fuzz target in `crates/hollow-fuzz-targets` (SEC-07). A target is a plain `fn(&[u8])` that must return without panicking, hanging or allocating without bound, and some also assert what the code promises (budgets, policy invariants). Inputs with several fields (a page and a list of clicks, a form action and its entries, two URLs) split them on the byte `0xFF`, which never occurs in UTF-8.
+
+| Target | Drives |
+|---|---|
+| `html` | `Document::parse` (HTML, inline CSS, URLs) and its accessors |
+| `css` | `Resources::insert_stylesheet`, then a fixed page styled by the sheet, laid out and painted |
+| `image` | `Resources::insert_image` (PNG, JPEG, GIF, WebP), then drawn at several sizes |
+| `layout` | `Layout::new` + `paint` + hit testing of a fuzzed page; the first two bytes pick a small viewport and scale |
+| `forms` | `Document::forms()` and `FormState::click`/`key` sequences; every submission goes through the broker's form encoder |
+| `ipc_renderer`, `ipc_net` | `read_frame` + `Validate` of `RendererToBroker` / `NetToBroker` (the sandbox boundary), then what the broker does with the URLs a valid message carries |
+| `url_policy` | `policy::parse_input`, `check`, `isolation_key`, `referer`, `to_request` |
+| `form_encode` | `form::to_request` (urlencoded, multipart, text/plain) |
+| `ct` | hollow-net's CT check: certificate DER and embedded SCT lists (fuzzed lists are spliced into a real certificate) |
+
+The URL policy and form encoder are in `hollow-app`'s library target and CT parsing in `hollow-net`'s (`src/lib.rs`; the binaries use them as before). The broker's and the network process's Windows-only dependencies are `cfg(windows)`, so the targets also build on Linux.
+
+Checked-in inputs, under 1 MB together: `fuzz/seeds/<target>` (pages from `target/sites` and WPT, stylesheets, WPT images, IPC streams and certificates; the binary ones are regenerated by `cargo test -p hollow-fuzz-targets --test corpus -- --ignored`), `fuzz/dict/{html,css,url}.dict` (libFuzzer format) and `fuzz/regressions/<target>`, the minimized inputs of bugs the fuzzers found. `cargo test --workspace` replays the seeds and regressions.
+
+**Stable (Windows, no nightly):** `cargo xtask fuzz [--target html,css] [--time <secs per target>] [--seed <n>]` runs every target (default 60 s each) one after another. It has no coverage feedback: it runs the corpus as-is, then seeded mutations of it, byte-level (bit flips, interesting integers, deletions, splices, repeats) and structure-aware (HTML/CSS token edits, number swaps, wrapping spans in elements or `@media`/`calc()`, attribute and declaration insertion, PNG checksums fixed up). Input `i` is a pure function of the seed and `i`, so a run is repeatable with `--seed`. Each input runs on a worker thread with the renderer's 1 MiB stack, under `catch_unwind` and a per-input budget (`--timeout`, 10 s), in a child process whose memory is watched (`--rss-mb`, 2048). A panic is minimized and saved; a hang or memory blow-up makes the child save the input and exit; a crash that kills the child (stack overflow, abort) is rebuilt from its input number by the parent. Findings go to `target/fuzz-crashes/<target>/` with a `.txt` note (message, seed, how to reproduce), and the run exits non-zero. `cargo xtask fuzz --run <file>` replays one input with the full panic message. `cargo xtask fuzz` first rebuilds xtask with the `fuzz` profile (`[profile.fuzz]` in `Cargo.toml`: optimized, with debug assertions and overflow checks) and runs that; `--debug` skips this.
+
+**libFuzzer (nightly):** `fuzz/` is a cargo-fuzz project with one binary per target, excluded from the workspace (it has its own `Cargo.lock`), so stable builds never see it. With `rustup toolchain install nightly` and `cargo +nightly install cargo-fuzz`, from the repository root:
+
+```
+cargo +nightly fuzz run html fuzz/corpus/html fuzz/seeds/html fuzz/regressions/html -- -dict=fuzz/dict/html.dict -max_total_time=600 -timeout=10
+```
+
+`fuzz/corpus/<target>` is libFuzzer's working corpus and `fuzz/artifacts/<target>` its findings (both git-ignored). On Windows this works with ASan (checked with nightly 2026-10-23 and MSVC 14.44): the AddressSanitizer runtime `clang_rt.asan_dynamic-x86_64.dll` must be on `PATH` when the target runs, from Visual Studio's `VC\Tools\MSVC\<version>\bin\Hostx64\x64`, and in PowerShell the `-flag=value` arguments after `--` need quotes (`"-dict=fuzz/dict/html.dict"`). On Linux nothing extra is needed. `-timeout`, `-rss_limit_mb=2048` and `-max_len=131072` match the stable fuzzer's limits. Dictionaries: `html` for html, layout and forms; `css` for css; `url` for url_policy and form_encode.
+
+**What "continuous" means for now:** there is no CI yet. Until there is, run `cargo xtask fuzz` (about 10 minutes for all targets) before merging parser or engine changes and before a release, and longer (`--time 1800`) when a parser changed. `.github/workflows/fuzz.yml` is the intended setup: on Linux, nightly cargo-fuzz with ASan for 20 minutes per target every night (2 minutes on pull requests that touch a parser), with each target's corpus kept in the Actions cache so coverage keeps growing, and findings uploaded as artifacts. Once it runs, a finding is fixed with its minimized input checked in under `fuzz/regressions/<target>/`.

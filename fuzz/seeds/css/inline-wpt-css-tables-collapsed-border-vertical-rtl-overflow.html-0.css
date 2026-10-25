@@ -1,0 +1,17 @@
+
+body { margin: 60px; }
+div { display: inline-block; }
+table {
+    writing-mode: vertical-rl;
+    direction: rtl;
+    border-collapse: collapse;
+    border: none;
+    will-change: transform;
+}
+td {
+    width: 40px;
+    height: 40px;
+    padding: 5px;
+}
+.thin td { border: 2px solid blue; }
+.thick td { border: 40px solid orange; }

@@ -1,3 +1,7 @@
 # Signed upstream bytes and test fixtures: never convert line endings.
 crates/hollow-net/ct/** -text
 crates/hollow-net/testdata/** -text
+# Fuzz inputs and certificates are bytes, not text.
+fuzz/seeds/** -text
+fuzz/regressions/** -text
+crates/hollow-fuzz-targets/data/** -text

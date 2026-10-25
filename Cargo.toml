@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# The cargo-fuzz project is its own workspace (nightly only).
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -29,3 +31,15 @@ tor-config-path = { path = "third_party/tor-config-path" }
 [profile.release]
 codegen-units = 1
 lto = "thin"
+
+# `cargo xtask fuzz` (SEC-07) rebuilds xtask with this before fuzzing:
+# optimized, but with the debug assertions and overflow checks that turn
+# silent bugs into panics the fuzzer can catch.
+[profile.fuzz]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+lto = false
+codegen-units = 16
+incremental = true
+debug = "line-tables-only"

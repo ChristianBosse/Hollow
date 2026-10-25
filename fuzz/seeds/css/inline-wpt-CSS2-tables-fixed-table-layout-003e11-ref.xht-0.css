@@ -1,0 +1,21 @@
+<![CDATA[
+  div
+  {
+  height: 24px;
+  margin-left: 108px;
+  }
+
+  div#blue-stripe
+  {
+  background-color: blue;
+  border-left: orange solid 20px;
+  border-right: orange solid 52px;
+  width: 128px;
+  }
+
+  div#reference
+  {
+  background-color: black;
+  width: 200px;
+  }
+  ]]>

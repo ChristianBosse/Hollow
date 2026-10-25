@@ -1,0 +1,19 @@
+<![CDATA[
+  div#overlapped-red {
+    background-color: red;
+    height: 100px;
+    position: absolute;
+    width: 100px;
+    z-index: -1;
+  }
+
+  table#overlapping-green {
+    border-bottom: green solid 100px;
+    border-spacing: 0;
+  }
+
+  caption {width: 100px;}
+
+  td {padding: 0;}
+
+  ]]>

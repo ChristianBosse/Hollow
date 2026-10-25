@@ -1,0 +1,6 @@
+# libFuzzer's working corpus, crash artifacts and coverage; the checked-in
+# inputs are in seeds/ and regressions/.
+/target
+/corpus
+/artifacts
+/coverage

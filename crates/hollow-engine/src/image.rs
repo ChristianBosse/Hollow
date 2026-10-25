@@ -93,6 +93,12 @@ fn decode_png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), ImageError> {
     let mut decoder = png::Decoder::new_with_limits(Cursor::new(bytes), limits);
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().map_err(|_| ImageError::Decode)?;
+    // png 0.18.1 panics (slice out of range) expanding a PLTE whose length
+    // isn't a whole number of RGB entries; such a palette is invalid anyway.
+    // PLTE must come before IDAT, so read_info has seen it.
+    if reader.info().palette.as_ref().is_some_and(|p| p.len() % 3 != 0) {
+        return Err(ImageError::Decode);
+    }
     let (w, h) = (reader.info().width, reader.info().height);
     check_size(w, h)?;
     let size = reader.output_buffer_size().ok_or(ImageError::TooLarge)?;
@@ -240,5 +246,40 @@ pub(crate) mod tests {
         huge[16..20].copy_from_slice(&20_000u32.to_be_bytes());
         huge[20..24].copy_from_slice(&20_000u32.to_be_bytes());
         assert!(decode(&huge).is_err());
+    }
+
+    /// One PNG chunk: length, type, data, CRC.
+    fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut crc = !0u32;
+        for &b in kind.iter().chain(data) {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            }
+        }
+        [&(data.len() as u32).to_be_bytes()[..], kind, data, &(!crc).to_be_bytes()].concat()
+    }
+
+    /// A 1x1 8-bit indexed PNG with the given PLTE contents.
+    fn indexed_png(palette: &[u8]) -> Vec<u8> {
+        // zlib, one stored block: filter byte 0, palette index 0.
+        let idat = [0x78, 0x01, 0x01, 0x02, 0x00, 0xFD, 0xFF, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01];
+        [
+            &b"\x89PNG\r\n\x1a\n"[..],
+            &chunk(b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 3, 0, 0, 0]),
+            &chunk(b"PLTE", palette),
+            &chunk(b"IDAT", &idat),
+            &chunk(b"IEND", &[]),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn palette_with_a_partial_entry_is_rejected() {
+        let pm = decode(&indexed_png(&[255, 0, 0])).unwrap();
+        assert_eq!(pm.data(), &[255, 0, 0, 255]);
+        // Found by fuzzing (SEC-07): png 0.18.1 panicked expanding a PLTE
+        // whose length isn't a multiple of 3.
+        assert_eq!(decode(&indexed_png(&[255, 0, 0, 7])).unwrap_err(), ImageError::Decode);
     }
 }

@@ -1,0 +1,17 @@
+
+div {
+    font: 50px/1 Ahem;
+    width: 1ch;
+}
+span {
+    background: green;
+    color: transparent;
+
+    unicode-bidi: plaintext;
+    hyphens: auto;
+}
+.ref {
+  position: absolute;
+  color: red;
+  z-index: -1;
+}

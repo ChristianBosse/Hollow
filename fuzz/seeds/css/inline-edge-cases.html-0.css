@@ -1,0 +1,3 @@
+
+body { margin: 0 } .a { width: calc(100% - 10px); } #x::before { content: "b" }
+table td { padding: 1e9px } @media (max-width: 100px) { p { display: none } }

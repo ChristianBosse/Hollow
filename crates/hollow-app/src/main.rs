@@ -6,12 +6,15 @@
 
 mod child;
 mod fetch;
-mod form;
 mod gui;
 mod net;
-mod policy;
 mod selftest;
 mod terminal;
+
+// URL policy and form encoding live in the library target (src/lib.rs) so
+// the fuzz targets can reach them; the rest of the broker uses them as
+// `crate::policy` and `crate::form`, as before.
+use hollow_app::{form, policy};
 
 use std::process::ExitCode;
 

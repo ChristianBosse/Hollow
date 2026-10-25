@@ -274,6 +274,11 @@ impl Forms {
         self.entry(node).map(|e| &e.control)
     }
 
+    /// A form control or a `<label>` for one.
+    pub fn is_control(&self, node: NodeId) -> bool {
+        self.index.contains_key(&node) || self.labels.contains_key(&node)
+    }
+
     pub fn is_disabled(&self, node: NodeId) -> bool {
         self.entry(node).is_some_and(|e| e.disabled)
     }

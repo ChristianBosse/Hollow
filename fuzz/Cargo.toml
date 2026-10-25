@@ -1,0 +1,105 @@
+# cargo-fuzz (libFuzzer) project for SEC-07: one binary per target in
+# crates/hollow-fuzz-targets. Needs nightly, from the repository root:
+#
+#     cargo +nightly fuzz run html fuzz/corpus/html fuzz/seeds/html -- -dict=fuzz/dict/html.dict
+#
+# See README.md (Developer checks, Fuzzing). It is its own workspace, so the
+# main (stable, pinned) build never sees it.
+
+[package]
+name = "hollow-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+hollow-fuzz-targets = { path = "../crates/hollow-fuzz-targets" }
+libfuzzer-sys = "0.4"
+
+[workspace]
+members = ["."]
+
+# The same patches as the main workspace (hollow-net's Arti); see
+# third_party/README.md.
+[patch.crates-io]
+saturating-time = { path = "../third_party/saturating-time" }
+tor-dirmgr = { path = "../third_party/tor-dirmgr" }
+arti-client = { path = "../third_party/arti-client" }
+tor-config-path = { path = "../third_party/tor-config-path" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "html"
+path = "fuzz_targets/html.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "css"
+path = "fuzz_targets/css.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image"
+path = "fuzz_targets/image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "layout"
+path = "fuzz_targets/layout.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "forms"
+path = "fuzz_targets/forms.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_renderer"
+path = "fuzz_targets/ipc_renderer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_net"
+path = "fuzz_targets/ipc_net.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "url_policy"
+path = "fuzz_targets/url_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "form_encode"
+path = "fuzz_targets/form_encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ct"
+path = "fuzz_targets/ct.rs"
+test = false
+doc = false
+bench = false

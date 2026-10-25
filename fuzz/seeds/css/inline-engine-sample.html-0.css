@@ -1,0 +1,17 @@
+
+  body { font-family: "Helvetica Neue", Arial, sans-serif; max-width: 760px; margin: 0 auto; padding: 0 16px; color: #222; }
+  nav a { margin-left: 12px; }
+  h1 { font-family: Georgia, serif; font-size: 2.2em; margin-bottom: 0.2em; }
+  .lede { font-size: 1.15em; color: #555; }
+  .note { background: #fff6d6; padding: 8px 12px; margin: 16px 0; }
+  a.btn { background-color: #0a7d3b; color: white; text-decoration: none; padding: 2px 6px; }
+  #promo { display: none; }
+  blockquote { color: #444; font-style: italic; margin-left: 24px; }
+  pre { background: #f2f2f2; padding: 10px; }
+  table.data { width: 100%; }
+  table.data th { background-color: #e3e9ef; text-align: left; padding: 4px 8px; }
+  table.data td { padding: 4px 8px; }
+  tr.odd td { background-color: #f7f7f7; }
+  footer { color: #777; font-size: 0.85em; text-align: center; margin: 32px 0 16px; }
+  @media (max-width: 600px) { body { font-size: 20px } }
+  p:hover { color: red }

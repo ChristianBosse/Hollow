@@ -1,0 +1,17 @@
+
+.container {
+  font: 20px/1 Ahem;
+  border: 5px solid gold;
+  inline-size: 16em;
+  block-size: 3em;
+  columns: 2;
+  column-fill: auto;
+  column-gap: 0;
+  margin-block-end: 1em;
+}
+.container.rtl {
+  direction: rtl;
+}
+.cb-rect {
+  color: green;
+}

@@ -1,0 +1,13 @@
+
+.parent {
+  position: relative;
+}
+.inline-content {
+  display: inline-block;
+  top: 0;
+  left: 0;
+  width: 100px;
+  height: 100px;
+  position: absolute;
+  background-color: green;
+}

@@ -1,0 +1,14 @@
+
+.container {
+  width: 300px;
+  background: pink;
+}
+div {
+  margin-bottom: 10px;
+}
+.purple {
+  border: purple solid 5px;
+}
+.orange {
+  background: orange;
+}

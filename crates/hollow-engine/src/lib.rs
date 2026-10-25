@@ -227,6 +227,13 @@ impl FormState {
     pub fn editing(&self) -> bool {
         self.forms.editing()
     }
+
+    /// Every form control and `<label>` of `doc` that a click can target,
+    /// in tree order. Lets tests and the fuzz targets drive
+    /// [`FormState::click`] without a layout to hit-test.
+    pub fn controls(&self, doc: &Document) -> Vec<ControlId> {
+        (0..doc.dom.nodes.len()).filter(|&n| self.forms.is_control(n)).map(ControlId).collect()
+    }
 }
 
 /// A form control of a document, as hit testing finds it.

@@ -2148,6 +2148,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hollow-fuzz-targets"
+version = "0.1.0"
+dependencies = [
+ "hollow-app",
+ "hollow-engine",
+ "hollow-ipc",
+ "hollow-net",
+ "url",
+]
+
+[[package]]
 name = "hollow-ipc"
 version = "0.1.0"
 dependencies = [
@@ -7649,6 +7660,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hollow-engine",
+ "hollow-fuzz-targets",
  "netstat2",
  "png",
  "scraper",

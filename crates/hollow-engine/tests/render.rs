@@ -1133,3 +1133,19 @@ fn opacity_zero_hides_the_whole_subtree() {
     assert_eq!(ink(&f, 0, 0, 300, 38), 0, "nothing of the transparent box shows");
     assert!(ink(&f, 0, 38, 300, 60) > 20, "partial opacity still draws");
 }
+
+/// Inputs the fuzzers found (SEC-07); each once panicked. The raw inputs are
+/// in fuzz/regressions/ too.
+#[test]
+fn fuzz_regressions() {
+    let inputs = [
+        // A table whose content has a large negative margin came out with a
+        // negative height, and clamping its corner radius panicked.
+        "<style>#t{display:table}</style><v id=t><d style='margin:-99px'><",
+    ];
+    for html in inputs {
+        let l = layout(html, 317.0);
+        let f = l.paint(0.0, 200.0, 1.0);
+        assert_eq!(f.rgba.len(), (f.width * f.height * 4) as usize);
+    }
+}

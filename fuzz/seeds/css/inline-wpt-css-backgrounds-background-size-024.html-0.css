@@ -1,0 +1,29 @@
+
+        #ref-overlapped-red {
+            background-color: red;
+            left: 30px;
+            height: 100px;
+            position: relative;
+            top: 30px;
+            width: 100px;
+        }
+        #test-overlapping-cat {
+            background-clip: content-box;
+            background-image: url(support/cat.png); /* 98px wide by 99px tall */
+            background-repeat: no-repeat;
+            background-size: 100% 100%;
+            border: transparent dotted 5px;
+            bottom: 100px;
+            height: 100px;
+            padding: 25px;
+            position: relative;
+            width: 100px;
+
+            /*
+            Background positioning area is 150px wide by 150px tall,
+            and background painting area is 100px wide by 100px tall.
+            So, the image should be scaled to 150px by 150px,
+            and then be clipped to 100px by 100px.
+            */
+        }
+    

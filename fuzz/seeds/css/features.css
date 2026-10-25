@@ -1,0 +1,34 @@
+@charset "utf-8";
+@import url("x.css") screen;
+@layer base, theme;
+@layer base { p { color: red } }
+:root { --gap: 4px; --w: calc(var(--gap) * 2); --loop: var(--loop); --a: var(--b, var(--c, 1px)) }
+html, body { margin: 0; padding: var(--gap) }
+.a > .b + .c ~ .d .e[data-x="1"][lang|=en][class~=y][href^="https"][href$=".org"][title*=z] { width: var(--w) }
+a:hover, a:visited, a:not(.x):is(.y, #z):where(p) { text-decoration: underline !important }
+li:nth-child(2n+1 of .a), li:nth-last-child(-n+3), li:nth-of-type(odd), :first-child:last-child:only-child { margin: 1px 2px 3px 4px }
+p::before { content: "\201C" attr(title) counter(x) } p::after { content: '' } ::first-line { font-weight: bold }
+div:has(> img) { float: right } :empty { display: none } *|* { box-sizing: border-box }
+@media screen and (min-width: 100px) and (max-width: 99999px), print and (orientation: landscape) {
+  @media (prefers-color-scheme: dark) { body { background: #000 } }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr) minmax(10px, auto) }
+}
+@supports (display: flex) and (not (display: grid)) { .f { display: flex } }
+@font-face { font-family: X; src: url(x.woff2) format("woff2"); unicode-range: U+0-7F, U+4??; }
+@keyframes k { from { opacity: 0 } 50% { opacity: .5 } to { opacity: 1 } }
+@page :first { margin: 1in }
+.f { flex: 1 1 0%; flex-flow: row-reverse wrap; justify-content: space-between; align-items: baseline; gap: 1em 2em; order: -1 }
+.p { position: absolute; inset: 0 auto auto 0; top: calc(50% - 1px); left: clamp(1px, 50vw, 100vmax); z-index: -2147483648 }
+.t { display: table; border-collapse: collapse; border-spacing: 2px 3px; table-layout: fixed }
+.m { width: min(100%, 500px, calc(1em + 2rem)); height: max(1px, 2ch); max-width: fit-content; min-height: -webkit-fill-available }
+.c { color: rgb(1 2 3 / 50%); background: hsl(120deg 50% 50%) url("data:image/png;base64,AA") no-repeat; border: 1px solid rgba(0,0,0,.5) }
+.c2 { color: #abc; color: #aabbccdd; color: transparent; color: currentColor; color: rebeccapurple; color: #ggg; color: rgb(300,-1,1e9) }
+.r { border-radius: 50% / 10px 20px; border-top-left-radius: 3px 4px; overflow: hidden auto }
+.x { font: italic small-caps bold 12px/1.5 "Helvetica Neue", Arial, sans-serif; letter-spacing: -1px; white-space: pre-wrap; text-indent: -9999px }
+.w { width: 1e38px; height: -1px; margin: -1e38px; padding: NaNpx; font-size: 1e9px; line-height: 0 }
+.u\:x\31 { color: red } #\31 23 { color: blue } .\@media { x: y }
+/* unterminated comment */ .z { color: red /* inside */ }
+.bad { color: ; : red; width: 10px 20px; ; ; }
+.v { width: var(--undefined); --empty:; --json: [{ "a": 1 }]; height: var(--json) }
+.e { content: "unterminated
+.after { color: green }

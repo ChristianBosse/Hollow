@@ -1,0 +1,4 @@
+
+div#gencon:before { content: attr(foo) attr(Foo) attr(fOO)
+                             attr(bar) attr(Bar) attr(bAR)
+                             attr(baz) attr(Baz) attr(BAZ) }

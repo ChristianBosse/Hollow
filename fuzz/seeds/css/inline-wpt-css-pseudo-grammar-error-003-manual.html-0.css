@@ -1,0 +1,12 @@
+
+  textarea
+    {
+      font-size: 300%;
+    }
+
+  textarea::grammar-error
+    {
+      color: maroon;
+      text-decoration: underline dotted red;
+    }
+  

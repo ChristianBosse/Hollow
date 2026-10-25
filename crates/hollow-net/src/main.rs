@@ -5,12 +5,15 @@
 //! byte through Tor. Because stdout is the IPC channel, all logging goes to
 //! stderr.
 
-mod ct;
 mod fetch;
 mod pq;
 mod profile;
 mod tls;
 mod tor;
+
+// CT parsing lives in the library target (src/lib.rs) so the fuzz targets can
+// reach it; tls.rs keeps using it as `crate::ct`.
+use hollow_net::ct;
 
 use std::io;
 use std::process::ExitCode;

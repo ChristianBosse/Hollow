@@ -1,0 +1,89 @@
+# Continuous fuzzing (SEC-07): every parser's libFuzzer target from fuzz/,
+# coverage-guided with AddressSanitizer, on Linux. The targets are the same
+# functions `cargo xtask fuzz` runs on Windows with the stable toolchain.
+#
+# Each target's working corpus is kept between runs in the Actions cache, so
+# coverage keeps growing night after night. A finding fails the job and is
+# uploaded as an artifact; minimize it (`cargo +nightly fuzz tmin`), fix the
+# bug, and check the input in under fuzz/regressions/<target>/ so
+# `cargo test` replays it from then on.
+name: fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "1200"
+  pull_request:
+    paths:
+      - "crates/hollow-engine/**"
+      - "crates/hollow-ipc/**"
+      - "crates/hollow-app/src/policy.rs"
+      - "crates/hollow-app/src/form.rs"
+      - "crates/hollow-net/src/ct.rs"
+      - "crates/hollow-net/src/ct/**"
+      - "crates/hollow-fuzz-targets/**"
+      - "fuzz/**"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: html, dict: html }
+          - { target: css, dict: css }
+          - { target: image, dict: "" }
+          - { target: layout, dict: html }
+          - { target: forms, dict: html }
+          - { target: ipc_renderer, dict: "" }
+          - { target: ipc_net, dict: "" }
+          - { target: url_policy, dict: url }
+          - { target: form_encode, dict: url }
+          - { target: ct, dict: "" }
+    env:
+      # Pull requests get a short smoke run; the nightly run goes deep.
+      SECONDS_PER_TARGET: ${{ github.event_name == 'pull_request' && '120' || inputs.seconds || '1200' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the stable release toolchain; fuzzing needs
+      # nightly, so every cargo call below says +nightly.
+      - name: Install nightly and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --locked
+
+      - name: Restore the corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Build
+        run: cargo +nightly fuzz build ${{ matrix.target }}
+
+      - name: Fuzz for ${{ env.SECONDS_PER_TARGET }} s
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }} fuzz/regressions/${{ matrix.target }}
+          dict=""
+          if [ -n "${{ matrix.dict }}" ]; then dict="-dict=fuzz/dict/${{ matrix.dict }}.dict"; fi
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} fuzz/regressions/${{ matrix.target }} \
+            -- -max_total_time=${{ env.SECONDS_PER_TARGET }} -timeout=10 -rss_limit_mb=2048 -max_len=131072 $dict
+
+      - name: Upload findings
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}

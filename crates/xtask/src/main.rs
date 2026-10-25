@@ -9,9 +9,12 @@
 //!   session left a Hollow trace on the host (property P5, host edition).
 //! - `wpt`: runs the Web Platform Tests reftests the Fortress engine can run; fails if a test in
 //!   `tests/wpt/expected.txt` no longer passes.
+//! - `fuzz`: the stable-toolchain fuzzer over every parser's fuzz target (SEC-07); fails on any
+//!   panic, hang or memory blow-up.
 
 mod consensus;
 mod dist;
+mod fuzz;
 mod leak;
 mod trace;
 mod wpt;
@@ -42,6 +45,17 @@ commands:
         --jobs <n>             Worker threads (default: one per CPU)
         --compare <dir>        Per-area table against wpt.fyi summaries (<browser>.json) in <dir>
         --save <dir>           Write PNGs of each failing test and its reference into <dir>
+    fuzz [options]             Mutation-fuzz the targets in crates/hollow-fuzz-targets (no nightly needed);
+                               findings go to target/fuzz-crashes/<target>/ and fail the run
+        --target <names>       Comma-separated targets (default: all, one after another)
+        --time <secs>          Per target (default 60)
+        --seed <n>             PRNG seed, for a repeatable run (default: from the clock, printed)
+        --timeout <secs>       Per-input time budget (default 10)
+        --rss-mb <n>           Memory limit for the fuzzing process (default 2048)
+        --max-len <bytes>      Largest generated input (default 131072)
+        --run <file>           Run one saved input instead (repeatable); the target is --target or
+                               the name of the file's folder
+        --debug                Don't rebuild xtask with the optimized `fuzz` profile first
 
 `dist`, `repro-check`, `leak-test` and `trace-test` pass --locked to cargo; add --unlocked to allow
 Cargo.lock updates.";
@@ -61,6 +75,7 @@ fn main() -> ExitCode {
         "leak-test" => leak::run(rest),
         "trace-test" => trace::run(rest),
         "wpt" => wpt::run(rest),
+        "fuzz" => fuzz::run(rest),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(true)

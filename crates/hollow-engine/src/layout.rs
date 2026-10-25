@@ -1788,7 +1788,9 @@ impl Ctx<'_> {
 
     fn paint_deco(&mut self, st: &Style, d: &Deco) {
         let r = d.rect;
-        let radius = st.radius.resolve(r.w.min(r.h)).clamp(0.0, r.w.min(r.h) / 2.0);
+        // A box can come out with a negative height (a table whose content
+        // has a large negative margin); `clamp` panics if max < min.
+        let radius = st.radius.resolve(r.w.min(r.h)).clamp(0.0, (r.w.min(r.h) / 2.0).max(0.0));
         if let (Some(slot), Some(color)) = (d.bg, st.background) {
             let (rect, radius) = match st.bg_color_clip {
                 crate::css::BoxArea::Border => (r, radius),
